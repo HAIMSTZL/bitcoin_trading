@@ -37,15 +37,20 @@ async def api_control(req: dict) -> JSONResponse:
     """
     engine = _engine()
     action = (req or {}).get("action")
-    if action in ("start", "resume"):
-        status = engine.start()
-    elif action == "pause":
-        status = engine.pause()
-    elif action == "stop":
-        status = engine.shutdown()
-    else:
+    try:
+        if action in ("start", "resume"):
+            status = engine.start()
+        elif action == "pause":
+            status = engine.pause()
+        elif action == "stop":
+            status = engine.shutdown()
+        else:
+            return JSONResponse(
+                {"ok": False, "error": f"未知操作: {action}"}, status_code=400
+            )
+    except Exception as e:
         return JSONResponse(
-            {"ok": False, "error": f"未知操作: {action}"}, status_code=400
+            {"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500
         )
     return JSONResponse({"ok": True, "run_status": status})
 

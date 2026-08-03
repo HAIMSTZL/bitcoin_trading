@@ -46,8 +46,42 @@ class Store:
                     updated REAL NOT NULL,
                     data    TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS events (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts      REAL NOT NULL,
+                    level   TEXT NOT NULL,
+                    type    TEXT NOT NULL,
+                    pair    TEXT,
+                    message TEXT NOT NULL,
+                    detail  TEXT NOT NULL DEFAULT '{}'
+                );
                 """
             )
+
+    # ------------------------------------------------------------------
+    # 事件日志（挂单/成交/控制/异常，供复盘）
+    # ------------------------------------------------------------------
+    def record_event(
+        self,
+        level: str,
+        type: str,
+        message: str,
+        pair: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO events(ts, level, type, pair, message, detail)"
+                " VALUES (?,?,?,?,?,?)",
+                (time.time(), level, type, pair, message, json.dumps(detail or {})),
+            )
+
+    def recent_events(self, limit: int = 100) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # 网格机器人状态（模拟盘重启后恢复用）

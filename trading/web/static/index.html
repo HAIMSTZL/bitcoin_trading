@@ -50,6 +50,8 @@
   #btnStop { border-color: #da3633; color: #f85149; }
   .run-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
   .run-dot.running { background: #3fb950; } .run-dot.paused { background: #d29922; } .run-dot.stopped { background: #f85149; }
+  .lv-INFO { color: #8b949e; } .lv-WARNING { color: #d29922; } .lv-ERROR { color: #f85149; font-weight: 600; }
+  #events td:nth-child(5) { text-align: left; }
 </style>
 </head>
 <body>
@@ -78,6 +80,13 @@
   <table>
     <thead><tr><th>时间</th><th>币对</th><th>方向</th><th>价格</th><th>数量</th><th>金额(USDT)</th><th>利润(USDT)</th></tr></thead>
     <tbody id="trades"></tbody>
+  </table>
+</div>
+
+<div class="section"><h2>运行日志（挂单 / 成交 / 控制 / 异常）</h2>
+  <table>
+    <thead><tr><th>时间</th><th>级别</th><th>类型</th><th>币对</th><th style="text-align:left">内容</th></tr></thead>
+    <tbody id="events"></tbody>
   </table>
 </div>
 
@@ -143,6 +152,20 @@ function renderTrades(trades) {
   ).join('') || '<tr><td colspan="7" style="text-align:center;color:#8b949e">暂无成交</td></tr>';
 }
 
+const EVENT_TYPE_TEXT = {
+  lifecycle: '生命周期', grid_init: '网格初始化', order_placed: '挂单',
+  order_filled: '成交', control: '控制', tick_error: '异常', live_order_error: '实盘异常',
+};
+
+function renderEvents(events) {
+  document.getElementById('events').innerHTML = (events || []).map(e =>
+    `<tr><td>${new Date(e.ts * 1000).toLocaleString()}</td>
+     <td class="lv-${e.level}">${e.level}</td>
+     <td>${EVENT_TYPE_TEXT[e.type] || e.type}</td>
+     <td>${e.pair || '-'}</td><td>${e.message}</td></tr>`
+  ).join('') || '<tr><td colspan="5" style="text-align:center;color:#8b949e">暂无日志</td></tr>';
+}
+
 const STATUS_TEXT = { running: '运行中', paused: '已暂停 / 待开始', stopped: '已停止' };
 
 async function control(action) {
@@ -181,6 +204,7 @@ function render(s) {
 
   document.getElementById('pairs').innerHTML = Object.values(s.pairs).map(renderPair).join('');
   renderTrades(s.recent_trades || []);
+  renderEvents(s.recent_events || []);
   if (s.equity_history) renderChart(s.equity_history);
 }
 

@@ -50,6 +50,12 @@ class GridBot:
         self.start_price: Optional[float] = None
         self.realized_profit = 0.0  # USDT 口径
         self.trade_count = 0
+        # 挂单事件回调（由引擎注入，用于日志记录）；签名为 fn(order_dict)
+        self.on_order: Optional[Callable[[dict], None]] = None
+
+    def _notify_order(self, order: dict) -> None:
+        if self.on_order:
+            self.on_order({"pair": self.pair, **order})
 
     # ------------------------------------------------------------------
     def start(self, price: float, account: PaperAccount) -> None:
@@ -73,6 +79,7 @@ class GridBot:
                     "quote_amount": quote_per,
                     "base_amount": quote_per / self.levels[i],
                 }
+                self._notify_order(self.orders[i])
         for i in sell_levels:
             if base_per > 0:
                 self.orders[i] = {
@@ -81,6 +88,7 @@ class GridBot:
                     "base_amount": base_per,
                     "buy_price": price,  # 初始库存以启动价为成本基准
                 }
+                self._notify_order(self.orders[i])
 
     # ------------------------------------------------------------------
     def step(
@@ -139,6 +147,7 @@ class GridBot:
             "base_amount": base_amount,
             "buy_price": buy_price,
         }
+        self._notify_order(self.orders[idx])
 
     def _place_buy(self, idx: int, base_amount: float) -> None:
         if idx < 0 or idx in self.orders:
@@ -150,6 +159,7 @@ class GridBot:
             "quote_amount": base_amount * price,
             "base_amount": base_amount,
         }
+        self._notify_order(self.orders[idx])
 
     def _on_fill(
         self,

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import traceback
 from typing import Any, Optional
 
 from gate_api import GateClient, SpotAPI
@@ -129,15 +130,23 @@ class Engine:
             saved = self.store.load_bot_states()
             if all(p in saved for p in config.PAIRS):
                 for pair in config.PAIRS:
-                    self.bots[pair] = GridBot.from_dict(saved[pair], self.account)
+                    bot = GridBot.from_dict(saved[pair], self.account)
+                    bot.on_order = self._on_order_placed
+                    self.bots[pair] = bot
                 log.info(
                     "已恢复上次模拟盘状态: %s",
                     {p: {"quote": round(self.account.get(p)["quote"], 4),
                          "base": round(self.account.get(p)["base"], 4),
                          "orders": len(self.bots[p].orders)} for p in config.PAIRS},
                 )
+                self._event("INFO", "lifecycle", "恢复上次模拟盘存档继续交易",
+                            detail={p: {"quote": self.account.get(p)["quote"],
+                                        "base": self.account.get(p)["base"],
+                                        "orders": len(self.bots[p].orders)}
+                                    for p in config.PAIRS})
                 return
             log.info("未找到模拟盘存档，按初始仓位新建网格")
+            self._event("INFO", "lifecycle", "未找到模拟盘存档，按初始仓位新建网格")
 
         budgets = self._initial_budgets()
         for pair in config.PAIRS:
@@ -151,11 +160,21 @@ class Engine:
             lower = price * (1 - cfg["range_pct"])
             upper = price * (1 + cfg["range_pct"])
             bot = GridBot(pair, lower, upper, cfg["grids"], quote_budget, base_budget)
+            bot.on_order = self._on_order_placed  # 先挂监听器，捕获初始挂单
             bot.start(price, self.account)
             self.bots[pair] = bot
             log.info(
                 "网格已启动 %s: 区间 %.6g ~ %.6g, %d 档, 挂单 %d 个",
                 pair, lower, upper, cfg["grids"], len(bot.orders),
+            )
+            self._event(
+                "INFO", "grid_init",
+                f"新建网格: 区间 {lower:.6g} ~ {upper:.6g}, {cfg['grids']} 档, "
+                f"挂单 {len(bot.orders)} 个, USDT={quote_budget:.4f}, 基础币={base_budget:.4f}",
+                pair=pair,
+                detail={"lower": lower, "upper": upper, "grids": cfg["grids"],
+                        "quote_budget": quote_budget, "base_budget": base_budget,
+                        "start_price": price},
             )
 
     def _initial_budgets(self) -> dict[str, tuple[float, float]]:
@@ -190,16 +209,49 @@ class Engine:
             self.store.save_bot_state(pair, bot.to_dict(self.account))
 
     # ------------------------------------------------------------------
+    # 事件日志
+    # ------------------------------------------------------------------
+    def _event(
+        self,
+        level: str,
+        type: str,
+        message: str,
+        pair: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        try:
+            self.store.record_event(level, type, message, pair, detail)
+        except Exception:
+            log.exception("事件落库失败: %s %s", type, message)
+
+    def _on_order_placed(self, order: dict) -> None:
+        side = "买入" if order["side"] == "buy" else "卖出"
+        self._event(
+            "INFO", "order_placed",
+            f"挂{side}单 @ {order['price']:.8g} 数量 {order['base_amount']:.8g}",
+            pair=order["pair"], detail=order,
+        )
+
+    # ------------------------------------------------------------------
     def _record_fill(self, fill: dict) -> None:
         self.store.record_trade(
             self.mode, fill["pair"], fill["side"], fill["price"],
             fill["amount"], fill["quote"], fill["profit"],
+        )
+        side = "买入" if fill["side"] == "buy" else "卖出"
+        self._event(
+            "INFO", "order_filled",
+            f"{side}成交 @ {fill['price']:.8g} 数量 {fill['amount']:.8g} "
+            f"金额 {fill['quote']:.4f} USDT 利润 {fill['profit']:.4f}",
+            pair=fill["pair"], detail=fill,
         )
         if self.mode == "live" and self.executor:
             try:
                 self.executor.execute(fill)
             except Exception as e:  # 实盘下单失败不中断引擎
                 log.error("实盘下单失败: %s", e)
+                self._event("ERROR", "live_order_error", f"实盘下单失败: {e}",
+                            pair=fill["pair"], detail={"fill": fill})
 
     def tick(self) -> None:
         self.prices = self._fetch_prices()
@@ -222,6 +274,7 @@ class Engine:
     # ------------------------------------------------------------------
     def run(self) -> None:
         log.info("引擎启动，模式=%s，轮询间隔=%ss", self.mode, config.TICK_INTERVAL)
+        self._event("INFO", "lifecycle", f"引擎线程启动, 模式={self.mode}")
         while not self._stop.is_set():
             if self._paused.is_set():
                 self._stop.wait(config.TICK_INTERVAL)
@@ -232,6 +285,8 @@ class Engine:
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
                 log.exception("tick 失败")
+                self._event("ERROR", "tick_error", self.last_error,
+                            detail={"traceback": traceback.format_exc()})
             self._stop.wait(config.TICK_INTERVAL)
 
     def start_background(self) -> None:
@@ -246,6 +301,7 @@ class Engine:
             return "stopped"
         self._paused.set()
         log.info("引擎已暂停")
+        self._event("INFO", "control", "用户暂停交易引擎")
         return "paused"
 
     def resume(self) -> str:
@@ -253,6 +309,7 @@ class Engine:
             return "stopped"
         self._paused.clear()
         log.info("引擎已恢复运行")
+        self._event("INFO", "control", "用户恢复交易引擎")
         return "running"
 
     def shutdown(self) -> str:
@@ -263,6 +320,7 @@ class Engine:
             self._thread.join(timeout=5)
         self._stopped = True
         log.info("引擎已停止")
+        self._event("INFO", "control", "用户停止交易引擎")
         return "stopped"
 
     def start(self) -> str:
@@ -273,6 +331,7 @@ class Engine:
             self._stopped = False
             self.start_background()
             log.info("引擎已重新启动")
+            self._event("INFO", "control", "用户重新启动交易引擎")
             return "running"
         return self.resume()
 
@@ -310,5 +369,6 @@ class Engine:
             "total_realized_profit": sum(s["realized_profit"] for s in pairs.values()),
             "pairs": pairs,
             "recent_trades": self.store.recent_trades(50),
+            "recent_events": self.store.recent_events(50),
             "equity_history": self.store.equity_history(300),
         }
