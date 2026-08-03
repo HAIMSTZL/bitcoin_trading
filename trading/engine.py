@@ -83,7 +83,7 @@ class Engine:
                 "LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK"
             )
         self.mode = config.TRADING_MODE
-        self.client = GateClient()
+        self.client = GateClient(timeout=20.0)  # 引擎用更长超时，容忍网络抖动
         self.spot = SpotAPI(self.client)
         self.store = Store()
         self.account = PaperAccount()
@@ -107,12 +107,13 @@ class Engine:
 
     # ------------------------------------------------------------------
     def _fetch_prices(self) -> dict[str, float]:
-        tickers = self.spot.list_tickers()
-        return {
-            t["currency_pair"]: float(t["last"])
-            for t in tickers
-            if t["currency_pair"] in config.PAIRS
-        }
+        """按币对分别查询 ticker（响应小、抗超时；全市场单次拉取响应数 MB 易超时）。"""
+        prices: dict[str, float] = {}
+        for pair in config.PAIRS:
+            tickers = self.spot.list_tickers(pair)
+            if tickers:
+                prices[pair] = float(tickers[0]["last"])
+        return prices
 
     def _real_spot_balances(self) -> dict[str, float]:
         return {a["currency"]: float(a["available"]) for a in self.spot.list_accounts()}
