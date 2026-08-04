@@ -73,6 +73,9 @@ python3.13 -m venv .venv
 export MY_GATE_KEY="..."     # 切勿写入代码或提交
 export MY_GATE_SECRET="..."
 
+# 可选: 网络必须走系统代理才能访问 Gate 时设置（默认直连，更快更稳）
+export GATE_USE_PROXY=true
+
 .venv/bin/python scripts/check_availability.py
 ```
 

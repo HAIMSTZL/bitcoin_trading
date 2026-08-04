@@ -44,6 +44,7 @@ class GateClient:
         secret: Optional[str] = None,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 10.0,
+        use_proxy: Optional[bool] = None,
     ):
         self.key = key or os.environ.get(ENV_KEY)
         self.secret = secret or os.environ.get(ENV_SECRET)
@@ -54,6 +55,11 @@ class GateClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
+        # 是否使用系统代理：默认直连（GATE_USE_PROXY=false/0 也视为直连）。
+        # 直连不可达的网络环境可设 GATE_USE_PROXY=true 走系统代理。
+        if use_proxy is None:
+            use_proxy = os.environ.get("GATE_USE_PROXY", "").lower() in ("1", "true", "yes")
+        self.session.trust_env = use_proxy
 
     # ------------------------------------------------------------------
     # 签名
