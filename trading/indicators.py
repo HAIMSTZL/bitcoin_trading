@@ -71,6 +71,29 @@ def book_pressure(order_book: dict, depth: int = 10) -> float:
     return bids / asks if asks > 0 else 1.0
 
 
+def atr_percent(candles: list[list], period: int = 14) -> float:
+    """平均真实波幅占价格的百分比（ATR%），衡量近期波动率。
+
+    candles: Gate K 线 [ts, 成交额, 收, 高, 低, 开, 量, 完结]，按时间升序。
+    TR = max(高-低, |高-前收|, |低-前收|)
+    """
+    rows = sorted(candles, key=lambda r: int(r[0]))
+    if len(rows) < period + 1:
+        return 0.0
+    closes = [float(r[2]) for r in rows]
+    highs = [float(r[3]) for r in rows]
+    lows = [float(r[4]) for r in rows]
+    trs = []
+    for i in range(1, len(rows)):
+        trs.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        ))
+    atr = sum(trs[-period:]) / period
+    return atr / closes[-1] * 100 if closes[-1] else 0.0
+
+
 def trade_pressure(trades: list[dict]) -> float:
     """主动买卖量比：主动买入量 / 主动卖出量。"""
     buy = sum(float(t["amount"]) for t in trades if t.get("side") == "buy")
@@ -135,6 +158,7 @@ class IndicatorEngine:
         return {
             "macd": m, "kdj": j,
             "book_ratio": ob, "trade_ratio": tp,
+            "atr_pct": atr_percent(candles),
             "signal": signal, "signal_text": signal_text,
         }
 

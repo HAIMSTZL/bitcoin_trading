@@ -129,10 +129,13 @@ GRID_CONFIG = {
 
 #### `quote_budget` / `base_budget`：预算（仅 `PAPER_MIRROR_REAL=false` 时生效）
 
-- `quote_budget`：用于买入的 USDT 总额，均匀分给中轴下方各档；
-- `base_budget`：用于卖出的基础币数量，均匀分给中轴上方各档。
-
-默认模式下这两个参数不生效——模拟盘直接镜像你的真实现货账户。
+- 总预算 `TOTAL_QUOTE_BUDGET`（默认 233 USDT）按**近期波动率动态分配**到各币对：
+  用 `INDICATOR_KLINE` 周期 K 线计算 ATR%（14 周期平均真实波幅），波动越大分得越多——
+  网格赚的就是波动的钱；`ALLOC_MIN_W`/`ALLOC_MAX_W`（默认 15%/60%）限制单币对占比，
+  计算失败时回退均分。设 `DYNAMIC_ALLOCATION=false` 退回三币对均分；
+- 分配结果记入运行日志（含各币对 ATR 与权重）；
+- `base_budget`：该交易对初始基础币数量（当前全为 0，纯 USDT 起步）；
+- 运行中各币对预算**隔离管理**；自动重建网格时沿用该币对当前余额，不跨币对再平衡。
 
 ### 5.3 指标信号过滤（v1.1 新增）
 
@@ -166,6 +169,12 @@ GRID_CONFIG = {
 | `INDICATOR_INTERVAL` | `30` | 指标刷新周期（秒） |
 | `INDICATOR_KLINE` | `5m` | 指标所用 K 线周期 |
 | `AUTO_RECENTER` | `true` | 价格跑出区间自动重建网格 |
+| `TOTAL_QUOTE_BUDGET` | `233` | 模拟盘虚拟 USDT 总预算 |
+| `DYNAMIC_ALLOCATION` | `true` | 按 ATR% 波动率动态分配预算；`false` 均分 |
+| `ALLOC_MIN_W` / `ALLOC_MAX_W` | `0.15` / `0.60` | 单币对预算占比下限/上限 |
+| `REBALANCE_INTERVAL` | `600` | 再平衡检查周期（秒） |
+| `REBALANCE_MIN_DRIFT` | `0.1` | 再平衡触发阈值（池子占比） |
+| `REBALANCE_SIGNAL_TILT` | `0.25` | 信号对权重的倾斜系数 |
 | `MAX_ORDER_QUOTE` | `50` | 实盘单笔最大 USDT 金额（风控上限） |
 | `GATE_USE_PROXY` | 直连 | `true` 时走系统代理访问 Gate |
 | `WEB_HOST` / `WEB_PORT` | `127.0.0.1:8000` | 面板监听地址 |
@@ -190,6 +199,21 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
   为中心重建网格，**保留持仓余额与已实现利润累计**，记录 `grid_recenter` 事件；
 - **配置变更**：`range_pct`/`grids` 修改后重启，检测到存档参数签名不一致时，
   按新参数重建网格（保留存档余额与利润），无需手动删库。
+
+### 5.7 定期再平衡：子弹仓位调整（v1.2 新增，仅模拟盘）
+
+每隔 `REBALANCE_INTERVAL` 秒（默认 600 = 10 分钟）执行一次检查：
+
+1. 按当时各币对 **ATR% × (1 + 0.25×趋势信号)** 重算目标权重——波动大、
+   信号偏多的币对分得更多子弹；
+2. 把三个币对的 **USDT 总额**按新权重重新分配（总额守恒），并用新预算
+   **重建买单侧**；持仓和卖单（含成本基准）一律不动；
+3. 若最大偏离不足阈值（池子的 `REBALANCE_MIN_DRIFT`=10% 或 1 USDT），
+   则本轮不动作——所以实际是"每 10 分钟检查，偏离够了才调"，多数周期是静默的。
+
+每次执行/检查都写入日志（`rebalance` 事件含权重与调动明细）。
+为什么不挪持仓：强制变现会把浮动亏损落成实亏并拆散网格，代价远大于收益；
+而买单侧在模拟盘是虚拟挂单，重切子弹零成本。
 
 ## 6. 撮合规则（模拟盘 vs 实盘）
 

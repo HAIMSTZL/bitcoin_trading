@@ -25,22 +25,39 @@ HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "600"))
 
 # ---- 模拟盘仓位 ----
 # true : 模拟盘初始仓位完全镜像真实现货账户（USDT 与各基础币按实际可用余额）；
-# false: 使用下方 GRID_CONFIG 中配置的虚拟 quote_budget / base_budget。
+# false: 使用下方 TOTAL_QUOTE_BUDGET 作为虚拟 USDT 总预算。
 PAPER_MIRROR_REAL = os.environ.get("PAPER_MIRROR_REAL", "false").lower() == "true"
+
+# ---- 虚拟资金总预算与动态分配 ----
+# 当前设定（用户指定）：纯 233 USDT 起步、无基础币持仓。
+TOTAL_QUOTE_BUDGET = float(os.environ.get("TOTAL_QUOTE_BUDGET", "233"))
+# true: 按各币对近期波动率（ATR%）动态分配总预算——网格赚波动的钱，
+#       波动越大分越多；ALLOC_MIN/MAX_W 限制单币对占比，防极端。
+# false: 三币对均分。
+DYNAMIC_ALLOCATION = os.environ.get("DYNAMIC_ALLOCATION", "true").lower() == "true"
+ALLOC_MIN_W = float(os.environ.get("ALLOC_MIN_W", "0.15"))
+ALLOC_MAX_W = float(os.environ.get("ALLOC_MAX_W", "0.60"))
+
+# ---- 定期再平衡（子弹仓位调整，仅模拟盘）----
+# 每隔 REBALANCE_INTERVAL 秒，按当时 ATR%×信号倾斜重算权重，
+# 把各币对【未被买单占用的空闲 USDT】按权重重新分配——只挪子弹，绝不动持仓；
+# 偏离不足池子的 REBALANCE_MIN_DRIFT 比例（且 <1U）时不动作，避免无效折腾。
+REBALANCE_INTERVAL = float(os.environ.get("REBALANCE_INTERVAL", "600"))
+REBALANCE_MIN_DRIFT = float(os.environ.get("REBALANCE_MIN_DRIFT", "0.1"))
+# 信号倾斜系数：偏多币对权重上调、偏空下调（0.25 = 信号 ±1 时权重 ±25%）
+REBALANCE_SIGNAL_TILT = float(os.environ.get("REBALANCE_SIGNAL_TILT", "0.25"))
 
 # ---- 网格参数（按交易对）----
 # range_pct   : 以启动时刻价格为中轴，网格区间上下浮动比例
 # grids       : 网格层数（价格档位数量）
-# quote_budget: （仅 PAPER_MIRROR_REAL=false 时生效）该交易对用于买入的 USDT 预算
-# base_budget : （仅 PAPER_MIRROR_REAL=false 时生效）该交易对用于卖出的基础币数量
+# base_budget : （仅 PAPER_MIRROR_REAL=false 时生效）该交易对初始基础币数量
 #
-# 当前设定（用户指定）：纯 233 USDT 起步、无基础币持仓，三币对均分。
 # 区间选取经验：档位间距 = 2*range_pct/(grids-1)，必须显著大于双边手续费
 # （约 0.2%），且与币种日常波动匹配。
 GRID_CONFIG: dict = {
-    "BTC_USDT": {"range_pct": 0.03, "grids": 21, "quote_budget": 233.0 / 3, "base_budget": 0.0},
-    "DOGE_USDT": {"range_pct": 0.04, "grids": 21, "quote_budget": 233.0 / 3, "base_budget": 0.0},
-    "ETH_USDT": {"range_pct": 0.035, "grids": 21, "quote_budget": 233.0 / 3, "base_budget": 0.0},
+    "BTC_USDT": {"range_pct": 0.03, "grids": 21, "base_budget": 0.0},
+    "DOGE_USDT": {"range_pct": 0.04, "grids": 21, "base_budget": 0.0},
+    "ETH_USDT": {"range_pct": 0.035, "grids": 21, "base_budget": 0.0},
 }
 
 # ---- 指标信号过滤 ----

@@ -152,6 +152,11 @@
   .node.active.blue, .node.active.red, .node.active.green { background: var(--ink); }
   .node.pnl { font-size: 12px; }
   .wire-label { position: absolute; font-size: 9px; color: var(--dim); transform: translate(-50%, -50%); letter-spacing: 1px; background: var(--bg); padding: 0 4px; }
+  .particle {
+    position: absolute; width: 8px; height: 8px; border-radius: 50%;
+    transform: translate(-50%, -50%); pointer-events: none; z-index: 5;
+    box-shadow: 0 0 6px 2px currentColor;
+  }
   .action-strip {
     border: 2px solid var(--ink); margin: 0 40px; padding: 8px; text-align: center;
     font-size: 13px; font-weight: 700; letter-spacing: 2px; background: var(--panel);
@@ -391,6 +396,7 @@ const WIRES = [
   ['rebuy', 'pnl', ''], ['resell', 'pnl', ''],
 ];
 const nodePos = {};
+const wirePaths = {};   // 'a>b' -> {p1, c1, c2, p2}（像素坐标，贝塞尔曲线）
 
 function buildTree() {
   const cvs = $('treeCanvas');
@@ -412,10 +418,12 @@ function drawWires() {
   svg.innerHTML = WIRES.map(([a, b]) => {
     const p1 = nodePos[a], p2 = nodePos[b];
     const mx = (p1.x + p2.x) / 2;
+    wirePaths[`${a}>${b}`] = { p1, c1: { x: mx, y: p1.y }, c2: { x: mx, y: p2.y }, p2 };
     return `<path d="M${p1.x},${p1.y} C${mx},${p1.y} ${mx},${p2.y} ${p2.x},${p2.y}"
       fill="none" stroke="#14161a" stroke-width="1.4" stroke-dasharray="4 3" opacity="0.55"/>`;
   }).join('');
-  // 文字标签
+  // 文字标签（先清旧的，避免 resize 时重复叠加）
+  cvs.querySelectorAll('.wire-label').forEach(el => el.remove());
   WIRES.forEach(([a, b, lbl]) => {
     if (!lbl) return;
     const p1 = nodePos[a], p2 = nodePos[b];
@@ -427,7 +435,82 @@ function drawWires() {
   });
 }
 
+/* ================= 粒子流动画 ================= */
+const particles = [];
+
+function bezPoint(w, t) {
+  const u = 1 - t;
+  return {
+    x: u * u * u * w.p1.x + 3 * u * u * t * w.c1.x + 3 * u * t * t * w.c2.x + t * t * t * w.p2.x,
+    y: u * u * u * w.p1.y + 3 * u * u * t * w.c1.y + 3 * u * t * t * w.c2.y + t * t * t * w.p2.y,
+  };
+}
+
+function spawnParticle(path, color, delay = 0, loop = false) {
+  if (!wirePaths[path[0]]) return;  // 布局未就绪
+  const el = document.createElement('div');
+  el.className = 'particle';
+  el.style.color = color; el.style.background = color;
+  $('treeCanvas').appendChild(el);
+  particles.push({ path, seg: 0, t: -delay, speed: 2.6, el, loop });
+}
+
+let lastAnimTs = 0;
+function animateParticles(ts) {
+  requestAnimationFrame(animateParticles);
+  const dt = Math.min((ts - lastAnimTs) / 1000, 0.1);
+  lastAnimTs = ts;
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.t += dt * p.speed;
+    if (p.t < 0) continue;  // 延迟中
+    while (p.t >= 1) {
+      if (p.seg < p.path.length - 1) { p.seg++; p.t -= 1; }
+      else if (p.loop) { p.seg = 0; p.t = -1.2; }  // 循环粒子停顿后再来一圈
+      else { p.el.remove(); particles.splice(i, 1); break; }
+    }
+    if (!particles[i]) continue;
+    const w = wirePaths[p.path[p.seg]];
+    if (!w) { p.el.remove(); particles.splice(i, 1); continue; }
+    const pos = bezPoint(w, Math.min(p.t, 1));
+    p.el.style.left = pos.x + 'px';
+    p.el.style.top = pos.y + 'px';
+  }
+}
+requestAnimationFrame(animateParticles);
+
+/* 主链路环境粒子：运行中每 2.5 秒沿 TICK→检测→等待→回环流一圈 */
+const AMBIENT_LOOP = ['tick>price', 'price>detect', 'detect>wait', 'wait>tick'];
+setInterval(() => {
+  if (!lastState || lastState.run_status !== 'running') return;
+  if (lastState.last_tick && Date.now() / 1000 - lastState.last_tick < 10) {
+    spawnParticle(AMBIENT_LOOP, '#8b949e');
+  }
+}, 2500);
+
+/* 成交粒子：买=蓝 卖=红，沿分支流向利润结算 */
+let lastFillEventId = null;
+function spawnFillParticles(s) {
+  const fills = (s.recent_events || []).filter(e => e.type === 'order_filled');
+  if (!fills.length) return;
+  const latest = fills[0];
+  if (latest.id === lastFillEventId) return;
+  lastFillEventId = latest.id;
+  if (Date.now() / 1000 - latest.ts > 30) return;  // 历史成交不补动画
+  let d = {};
+  try { d = JSON.parse(latest.detail || '{}'); } catch (_) {}
+  const isBuy = d.side === 'buy';
+  const path = isBuy
+    ? ['detect>buy', 'buy>rebuy', 'rebuy>pnl']
+    : ['detect>sell', 'sell>resell', 'resell>pnl'];
+  const color = isBuy ? '#2557d6' : '#c9362b';
+  spawnParticle(path, color);
+  spawnParticle(path, color, 0.18);  // 双粒子拖尾
+  spawnParticle(['rebuy>pnl'], '#1a7f37', 0.5);  // 绿色收尾流向利润
+}
+
 function updateTree(s) {
+  spawnFillParticles(s);
   const now = Date.now() / 1000;
   const active = new Set(['tick', 'price', 'detect']);  // 常态链路
   // 最近 10 秒内的事件高亮对应节点
@@ -474,6 +557,7 @@ const EVENT_TYPE_TEXT = {
   lifecycle: '生命周期', grid_init: '网格初始化', order_placed: '挂单',
   order_filled: '成交', control: '控制', tick_error: '异常', live_order_error: '实盘异常',
   health: '健康监测', grid_recenter: '网格重建', signal_change: '信号翻转',
+  rebalance: '再平衡',
 };
 const SIGNAL_TEXT = { 1: '偏多·停卖', 0: '中性', '-1': '偏空·停买' };
 const SIGNAL_CLS = { 1: 'up', 0: '', '-1': 'down' };

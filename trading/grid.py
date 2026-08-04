@@ -164,6 +164,25 @@ class GridBot:
         }
         self._notify_order(self.orders[idx])
 
+    def rebuild_buys(self, price: float, account: PaperAccount) -> None:
+        """重建买单侧（卖单与成本基准保持不变）：子弹补充/再平衡时使用。"""
+        self.orders = {i: o for i, o in self.orders.items() if o["side"] != "buy"}
+        bal = account.get(self.pair)
+        buy_levels = [i for i, p in enumerate(self.levels)
+                      if p < price and i not in self.orders]
+        if not buy_levels:
+            return
+        quote_per = bal["quote"] / len(buy_levels)
+        for i in buy_levels:
+            if quote_per > 0 and not self._blocked("buy"):
+                self.orders[i] = {
+                    "side": "buy",
+                    "price": self.levels[i],
+                    "quote_amount": quote_per,
+                    "base_amount": quote_per / self.levels[i],
+                }
+                self._notify_order(self.orders[i])
+
     def _place_buy(self, idx: int, base_amount: float) -> None:
         if idx < 0 or idx in self.orders or self._blocked("buy"):
             return  # 超出区间底部：买入后等待即可；偏空信号：不接飞刀

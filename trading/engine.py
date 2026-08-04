@@ -21,7 +21,7 @@ from gate_api import GateClient, SpotAPI
 
 from . import config
 from .grid import GridBot, PaperAccount
-from .indicators import IndicatorEngine
+from .indicators import IndicatorEngine, atr_percent
 from .store import Store
 
 log = logging.getLogger("trading.engine")
@@ -103,6 +103,7 @@ class Engine:
         self.indicators = IndicatorEngine(self.spot, interval=config.INDICATOR_KLINE)
         self._last_indicator = 0.0
         self._last_signals: dict[str, int] = {}  # 各币对上一次信号，用于变更事件
+        self._last_rebalance = time.time()  # 启动后过完整周期才首次再平衡
 
         self._init_bots()
         if self.mode == "live":
@@ -181,8 +182,10 @@ class Engine:
     @staticmethod
     def _config_sig() -> dict[str, str]:
         """各币对网格参数签名，用于检测配置变更后重建。"""
+        mode = "dyn" if config.DYNAMIC_ALLOCATION else "eq"
         return {
-            p: f'{config.GRID_CONFIG[p]["range_pct"]}:{config.GRID_CONFIG[p]["grids"]}'
+            p: (f'{config.GRID_CONFIG[p]["range_pct"]}:{config.GRID_CONFIG[p]["grids"]}'
+                f':{config.TOTAL_QUOTE_BUDGET}:{mode}')
             for p in config.PAIRS
         }
 
@@ -247,10 +250,60 @@ class Engine:
             log.info("镜像真实账户: USDT=%s, 持仓=%s", usdt, bases)
             return budgets
         return {
-            p: (config.GRID_CONFIG[p]["quote_budget"],
+            p: (self._allocate_quotes().get(p, 0.0),
                 float(config.GRID_CONFIG[p]["base_budget"]))
             for p in config.PAIRS
         }
+
+    def _allocate_quotes(self) -> dict[str, float]:
+        """把 TOTAL_QUOTE_BUDGET 按近期波动率（ATR%）动态分配到各币对。
+
+        网格策略赚的是波动的钱：ATR% 越高权重越大；
+        ALLOC_MIN_W/MAX_W 限制单币对占比。失败时回退均分。
+        """
+        n = len(config.PAIRS)
+        total = config.TOTAL_QUOTE_BUDGET
+        if not config.DYNAMIC_ALLOCATION:
+            return {p: total / n for p in config.PAIRS}
+        try:
+            vols = {}
+            for pair in config.PAIRS:
+                candles = self.spot.list_candlesticks(pair, config.INDICATOR_KLINE, 40)
+                vols[pair] = atr_percent(candles)
+            if sum(vols.values()) <= 0:
+                raise ValueError("ATR 全为 0")
+            weights = {p: v / sum(vols.values()) for p, v in vols.items()}
+            # 夹紧到 [MIN, MAX] 后按剩余比例再分配（两轮收敛即可）
+            for _ in range(2):
+                fixed = {p: w for p, w in weights.items()
+                         if w <= config.ALLOC_MIN_W or w >= config.ALLOC_MAX_W}
+                free = [p for p in weights if p not in fixed]
+                fixed_total = sum(
+                    min(max(w, config.ALLOC_MIN_W), config.ALLOC_MAX_W)
+                    for w in fixed.values()
+                )
+                free_total = sum(weights[p] for p in free)
+                weights = {
+                    p: (min(max(weights[p], config.ALLOC_MIN_W), config.ALLOC_MAX_W)
+                        if p in fixed else weights[p] / free_total * (1 - fixed_total))
+                    for p in weights
+                }
+            alloc = {p: total * weights[p] for p in config.PAIRS}
+            log.info("动态预算分配: %s (ATR%%: %s)",
+                     {p: round(a, 2) for p, a in alloc.items()},
+                     {p: round(v, 3) for p, v in vols.items()})
+            self._event(
+                "INFO", "lifecycle",
+                "动态预算分配: " + ", ".join(
+                    f"{p} {a:.2f}U (ATR {vols[p]:.2f}%, 权重 {weights[p]*100:.0f}%)"
+                    for p, a in alloc.items()
+                ),
+                detail={"alloc": alloc, "atr_pct": vols, "weights": weights},
+            )
+            return alloc
+        except Exception as e:
+            log.warning("动态分配失败(%s)，回退均分", e)
+            return {p: total / n for p in config.PAIRS}
 
     def _save_bot_states(self) -> None:
         if self.mode != "paper":
@@ -309,6 +362,7 @@ class Engine:
     def tick(self) -> None:
         self.prices = self._fetch_prices()
         self._update_indicators()
+        self._maybe_rebalance()
         for pair, bot in self.bots.items():
             price = self.prices.get(pair)
             if not price:
@@ -355,6 +409,65 @@ class Engine:
                     detail={"from": self._last_signals[pair], "to": sig, **ind},
                 )
             self._last_signals[pair] = sig
+
+    # ------------------------------------------------------------------
+    def _maybe_rebalance(self) -> None:
+        """定期再平衡（仅模拟盘）：按 ATR%×信号倾斜重算权重，
+        重新分配各币对的全部 USDT 子弹并重建买单侧——
+        只挪 USDT，绝不动持仓；卖单及其成本基准保持不变。
+
+        偏离不足阈值（池子的 REBALANCE_MIN_DRIFT 或 1U）时不动作。
+        """
+        if self.mode != "paper":
+            return
+        now = time.time()
+        if now - self._last_rebalance < config.REBALANCE_INTERVAL:
+            return
+        self._last_rebalance = now
+
+        # 权重 = ATR% × (1 + 倾斜系数×信号)
+        raw = {}
+        for pair in config.PAIRS:
+            ind = self.indicators.get(pair)
+            atr = max(ind.get("atr_pct", 0.0), 1e-6)
+            sig = ind.get("signal", 0) if config.USE_SIGNAL_FILTER else 0
+            raw[pair] = atr * (1 + config.REBALANCE_SIGNAL_TILT * sig)
+        total_raw = sum(raw.values())
+        weights = {p: v / total_raw for p, v in raw.items()}
+
+        # 子弹池 = 各币对 USDT 总额（买单是虚拟挂单，重切子弹零成本）
+        pool = sum(self.account.get(p)["quote"] for p in config.PAIRS)
+        if pool < 3:
+            return  # 没有值得挪动的子弹
+
+        deltas = {
+            p: pool * weights[p] - self.account.get(p)["quote"]
+            for p in config.PAIRS
+        }
+        if max(abs(d) for d in deltas.values()) < max(1.0, pool * config.REBALANCE_MIN_DRIFT):
+            log.info("再平衡检查: 偏离不足阈值，不动作 (池子 %.2fU, 权重 %s)",
+                     pool, {p: round(w, 2) for p, w in weights.items()})
+            return
+
+        # 执行：重设各币对 USDT = 池子×权重（总额守恒），并按新预算重建买单侧
+        for pair in config.PAIRS:
+            self.account.get(pair)["quote"] = pool * weights[pair]
+        for pair, bot in self.bots.items():
+            price = self.prices.get(pair)
+            if price:
+                bot.rebuild_buys(price, self.account)
+
+        moves = {p: round(d, 2) for p, d in deltas.items() if abs(d) >= 0.01}
+        log.info("再平衡执行: 池子 %.2fU, 权重 %s, 调动 %s",
+                 pool, {p: round(w, 2) for p, w in weights.items()}, moves)
+        self._event(
+            "INFO", "rebalance",
+            "子弹再平衡: " + ", ".join(
+                f"{p.split('_')[0]} {'+' if d > 0 else ''}{d:.2f}U" for p, d in moves.items()
+            ) + f" (池子 {pool:.2f}U, 权重 "
+            + "/".join(f"{p.split('_')[0]}{w*100:.0f}%" for p, w in weights.items()) + ")",
+            detail={"pool": pool, "weights": weights, "deltas": deltas},
+        )
 
     # ------------------------------------------------------------------
     def _maybe_health_check(self) -> None:
