@@ -24,20 +24,37 @@ TICK_INTERVAL = float(os.environ.get("TICK_INTERVAL", "3"))
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "600"))
 
 # ---- 模拟盘仓位 ----
-# true: 模拟盘初始仓位完全镜像真实现货账户（USDT 与各基础币按实际可用余额）；
+# true : 模拟盘初始仓位完全镜像真实现货账户（USDT 与各基础币按实际可用余额）；
 # false: 使用下方 GRID_CONFIG 中配置的虚拟 quote_budget / base_budget。
-PAPER_MIRROR_REAL = os.environ.get("PAPER_MIRROR_REAL", "true").lower() == "true"
+PAPER_MIRROR_REAL = os.environ.get("PAPER_MIRROR_REAL", "false").lower() == "true"
 
 # ---- 网格参数（按交易对）----
 # range_pct   : 以启动时刻价格为中轴，网格区间上下浮动比例
 # grids       : 网格层数（价格档位数量）
 # quote_budget: （仅 PAPER_MIRROR_REAL=false 时生效）该交易对用于买入的 USDT 预算
 # base_budget : （仅 PAPER_MIRROR_REAL=false 时生效）该交易对用于卖出的基础币数量
+#
+# 当前设定（用户指定）：纯 233 USDT 起步、无基础币持仓，三币对均分。
+# 区间选取经验：档位间距 = 2*range_pct/(grids-1)，必须显著大于双边手续费
+# （约 0.2%），且与币种日常波动匹配。
 GRID_CONFIG: dict = {
-    "BTC_USDT": {"range_pct": 0.06, "grids": 21, "quote_budget": 100.0, "base_budget": 0.0},
-    "DOGE_USDT": {"range_pct": 0.12, "grids": 21, "quote_budget": 50.0, "base_budget": 0.0},
-    "ETH_USDT": {"range_pct": 0.08, "grids": 21, "quote_budget": 100.0, "base_budget": 0.0},
+    "BTC_USDT": {"range_pct": 0.03, "grids": 21, "quote_budget": 233.0 / 3, "base_budget": 0.0},
+    "DOGE_USDT": {"range_pct": 0.04, "grids": 21, "quote_budget": 233.0 / 3, "base_budget": 0.0},
+    "ETH_USDT": {"range_pct": 0.035, "grids": 21, "quote_budget": 233.0 / 3, "base_budget": 0.0},
 }
+
+# ---- 指标信号过滤 ----
+# true: MACD/KDJ/盘口/主动成交 汇总为趋势信号，偏空时暂停挂买单（不接飞刀）、
+#       偏多时暂停挂卖单（不卖飞）；false: 不使用信号，双向正常挂单。
+USE_SIGNAL_FILTER = os.environ.get("USE_SIGNAL_FILTER", "true").lower() == "true"
+# 指标刷新周期（秒），独立于行情 tick（K线+盘口+逐笔 3 个接口/币对/次）
+INDICATOR_INTERVAL = float(os.environ.get("INDICATOR_INTERVAL", "30"))
+# 指标所用 K 线周期
+INDICATOR_KLINE = os.environ.get("INDICATOR_KLINE", "5m")
+
+# ---- 网格自动重建 ----
+# true: 价格涨破/跌破网格区间时，以当前价格为中心自动重建网格（保留持仓与利润累计）
+AUTO_RECENTER = os.environ.get("AUTO_RECENTER", "true").lower() == "true"
 
 # ---- 实盘风控 ----
 # 单笔订单最大 USDT 金额（实盘模式下强制约束）

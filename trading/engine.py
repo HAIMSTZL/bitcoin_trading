@@ -21,6 +21,7 @@ from gate_api import GateClient, SpotAPI
 
 from . import config
 from .grid import GridBot, PaperAccount
+from .indicators import IndicatorEngine
 from .store import Store
 
 log = logging.getLogger("trading.engine")
@@ -99,6 +100,9 @@ class Engine:
         self._thread: Optional[threading.Thread] = None
         self._snapshot_counter = 0
         self._last_health = 0.0  # 首次 tick 即报一条健康状态，之后按间隔
+        self.indicators = IndicatorEngine(self.spot, interval=config.INDICATOR_KLINE)
+        self._last_indicator = 0.0
+        self._last_signals: dict[str, int] = {}  # 各币对上一次信号，用于变更事件
 
         self._init_bots()
         if self.mode == "live":
@@ -131,53 +135,97 @@ class Engine:
         if self.mode == "paper":
             saved = self.store.load_bot_states()
             if all(p in saved for p in config.PAIRS):
+                sig_now = self._config_sig()
+                if all(saved[p].get("config_sig") == sig_now[p] for p in config.PAIRS):
+                    for pair in config.PAIRS:
+                        bot = GridBot.from_dict(saved[pair], self.account)
+                        bot.on_order = self._on_order_placed
+                        self.bots[pair] = bot
+                    log.info(
+                        "已恢复上次模拟盘状态: %s",
+                        {p: {"quote": round(self.account.get(p)["quote"], 4),
+                             "base": round(self.account.get(p)["base"], 4),
+                             "orders": len(self.bots[p].orders)} for p in config.PAIRS},
+                    )
+                    self._event("INFO", "lifecycle", "恢复上次模拟盘存档继续交易",
+                                detail={p: {"quote": self.account.get(p)["quote"],
+                                            "base": self.account.get(p)["base"],
+                                            "orders": len(self.bots[p].orders)}
+                                        for p in config.PAIRS})
+                    return
+                # 网格参数已变更：保留存档中的余额与利润，按新参数重建网格
+                log.info("网格参数已变更，按新参数重建（保留余额与利润）")
+                self._event("INFO", "lifecycle", "网格参数变更，按新参数重建网格（保留余额与利润）")
                 for pair in config.PAIRS:
-                    bot = GridBot.from_dict(saved[pair], self.account)
-                    bot.on_order = self._on_order_placed
+                    d = saved[pair]
+                    self.account.init_pair(pair, d["quote"], d["base"])
+                    bot = self._build_bot(pair, self.prices[pair],
+                                          d["quote"], d["base"])
+                    bot.realized_profit = d.get("realized_profit", 0.0)
+                    bot.trade_count = d.get("trade_count", 0)
+                    bot.blocked_count = d.get("blocked_count", 0)
                     self.bots[pair] = bot
-                log.info(
-                    "已恢复上次模拟盘状态: %s",
-                    {p: {"quote": round(self.account.get(p)["quote"], 4),
-                         "base": round(self.account.get(p)["base"], 4),
-                         "orders": len(self.bots[p].orders)} for p in config.PAIRS},
-                )
-                self._event("INFO", "lifecycle", "恢复上次模拟盘存档继续交易",
-                            detail={p: {"quote": self.account.get(p)["quote"],
-                                        "base": self.account.get(p)["base"],
-                                        "orders": len(self.bots[p].orders)}
-                                    for p in config.PAIRS})
                 return
             log.info("未找到模拟盘存档，按初始仓位新建网格")
             self._event("INFO", "lifecycle", "未找到模拟盘存档，按初始仓位新建网格")
 
         budgets = self._initial_budgets()
         for pair in config.PAIRS:
-            cfg = config.GRID_CONFIG[pair]
             price = self.prices.get(pair)
             if not price:
                 raise RuntimeError(f"未获取到 {pair} 行情")
-
             quote_budget, base_budget = budgets[pair]
             self.account.init_pair(pair, quote_budget, base_budget)
-            lower = price * (1 - cfg["range_pct"])
-            upper = price * (1 + cfg["range_pct"])
-            bot = GridBot(pair, lower, upper, cfg["grids"], quote_budget, base_budget)
-            bot.on_order = self._on_order_placed  # 先挂监听器，捕获初始挂单
-            bot.start(price, self.account)
-            self.bots[pair] = bot
-            log.info(
-                "网格已启动 %s: 区间 %.6g ~ %.6g, %d 档, 挂单 %d 个",
-                pair, lower, upper, cfg["grids"], len(bot.orders),
-            )
-            self._event(
-                "INFO", "grid_init",
-                f"新建网格: 区间 {lower:.6g} ~ {upper:.6g}, {cfg['grids']} 档, "
-                f"挂单 {len(bot.orders)} 个, USDT={quote_budget:.4f}, 基础币={base_budget:.4f}",
-                pair=pair,
-                detail={"lower": lower, "upper": upper, "grids": cfg["grids"],
-                        "quote_budget": quote_budget, "base_budget": base_budget,
-                        "start_price": price},
-            )
+            self.bots[pair] = self._build_bot(pair, price, quote_budget, base_budget)
+
+    @staticmethod
+    def _config_sig() -> dict[str, str]:
+        """各币对网格参数签名，用于检测配置变更后重建。"""
+        return {
+            p: f'{config.GRID_CONFIG[p]["range_pct"]}:{config.GRID_CONFIG[p]["grids"]}'
+            for p in config.PAIRS
+        }
+
+    def _build_bot(
+        self, pair: str, price: float, quote_budget: float, base_budget: float
+    ) -> GridBot:
+        cfg = config.GRID_CONFIG[pair]
+        lower = price * (1 - cfg["range_pct"])
+        upper = price * (1 + cfg["range_pct"])
+        bot = GridBot(pair, lower, upper, cfg["grids"], quote_budget, base_budget)
+        bot.on_order = self._on_order_placed  # 先挂监听器，捕获初始挂单
+        bot.start(price, self.account)
+        log.info(
+            "网格已启动 %s: 区间 %.6g ~ %.6g, %d 档, 挂单 %d 个",
+            pair, lower, upper, cfg["grids"], len(bot.orders),
+        )
+        self._event(
+            "INFO", "grid_init",
+            f"新建网格: 区间 {lower:.6g} ~ {upper:.6g}, {cfg['grids']} 档, "
+            f"挂单 {len(bot.orders)} 个, USDT={quote_budget:.4f}, 基础币={base_budget:.4f}",
+            pair=pair,
+            detail={"lower": lower, "upper": upper, "grids": cfg["grids"],
+                    "quote_budget": quote_budget, "base_budget": base_budget,
+                    "start_price": price},
+        )
+        return bot
+
+    def _recenter(self, pair: str, price: float) -> None:
+        """价格跑出网格区间：以当前价为中心重建网格，保留余额与利润累计。"""
+        old = self.bots[pair]
+        bal = self.account.get(pair)
+        bot = self._build_bot(pair, price, bal["quote"], bal["base"])
+        bot.realized_profit = old.realized_profit
+        bot.trade_count = old.trade_count
+        bot.blocked_count = old.blocked_count
+        self.bots[pair] = bot
+        log.warning("%s 价格 %.6g 跑出区间 [%.6g, %.6g]，网格已重建", pair, price, old.lower, old.upper)
+        self._event(
+            "WARNING", "grid_recenter",
+            f"价格 {price:.6g} 跑出区间 [{old.lower:.6g}, {old.upper:.6g}]，以现价为中心重建网格",
+            pair=pair,
+            detail={"old_lower": old.lower, "old_upper": old.upper, "price": price},
+        )
 
     def _initial_budgets(self) -> dict[str, tuple[float, float]]:
         if config.PAPER_MIRROR_REAL:
@@ -207,8 +255,11 @@ class Engine:
     def _save_bot_states(self) -> None:
         if self.mode != "paper":
             return
+        sig = self._config_sig()
         for pair, bot in self.bots.items():
-            self.store.save_bot_state(pair, bot.to_dict(self.account))
+            data = bot.to_dict(self.account)
+            data["config_sig"] = sig[pair]
+            self.store.save_bot_state(pair, data)
 
     # ------------------------------------------------------------------
     # 事件日志
@@ -257,10 +308,14 @@ class Engine:
 
     def tick(self) -> None:
         self.prices = self._fetch_prices()
+        self._update_indicators()
         for pair, bot in self.bots.items():
             price = self.prices.get(pair)
-            if price:
-                bot.step(price, self.account, record=self._record_fill)
+            if not price:
+                continue
+            if config.AUTO_RECENTER and (price > bot.upper or price < bot.lower):
+                self._recenter(pair, price)
+            self.bots[pair].step(price, self.account, record=self._record_fill)
         self.last_tick = time.time()
         self._save_bot_states()  # 模拟盘每个 tick 落盘，保证重启后可续跑
 
@@ -273,6 +328,33 @@ class Engine:
                 {p: s["equity"] for p, s in state["pairs"].items()},
             )
         self._maybe_health_check()
+
+    # ------------------------------------------------------------------
+    def _update_indicators(self) -> None:
+        """按周期刷新指标，写入各网格的趋势信号，信号翻转时记录事件。"""
+        now = time.time()
+        if now - self._last_indicator < config.INDICATOR_INTERVAL:
+            return
+        self._last_indicator = now
+        self.indicators.update(config.PAIRS)
+        for pair in config.PAIRS:
+            ind = self.indicators.get(pair)
+            sig = ind["signal"] if config.USE_SIGNAL_FILTER else 0
+            bot = self.bots.get(pair)
+            if bot:
+                bot.signal = sig
+            if pair in self._last_signals and self._last_signals[pair] != sig:
+                names = {1: "偏多(暂停卖单)", 0: "中性(双向挂单)", -1: "偏空(暂停买单)"}
+                log.info("%s 趋势信号翻转: %s -> %s | %s",
+                         pair, names.get(self._last_signals[pair]), names.get(sig),
+                         ind["signal_text"])
+                self._event(
+                    "INFO", "signal_change",
+                    f"趋势信号: {names.get(self._last_signals[pair])} → {names.get(sig)} · {ind['signal_text']}",
+                    pair=pair,
+                    detail={"from": self._last_signals[pair], "to": sig, **ind},
+                )
+            self._last_signals[pair] = sig
 
     # ------------------------------------------------------------------
     def _maybe_health_check(self) -> None:
@@ -401,6 +483,8 @@ class Engine:
             "total_pnl": total_equity - total_initial,
             "total_realized_profit": sum(s["realized_profit"] for s in pairs.values()),
             "pairs": pairs,
+            "indicators": {p: self.indicators.get(p) for p in config.PAIRS},
+            "signal_filter": config.USE_SIGNAL_FILTER,
             "recent_trades": self.store.recent_trades(50),
             "recent_events": self.store.recent_events(50),
             "equity_history": self.store.equity_history(300),

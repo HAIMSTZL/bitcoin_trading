@@ -50,6 +50,10 @@ class GridBot:
         self.start_price: Optional[float] = None
         self.realized_profit = 0.0  # USDT 口径
         self.trade_count = 0
+        # 趋势信号（引擎每个 tick 写入）：+1 偏多 / 0 中性 / -1 偏空
+        # 偏空暂停挂买单（不接飞刀），偏多暂停挂卖单（不卖飞）
+        self.signal = 0
+        self.blocked_count = 0  # 被信号拦截的挂单次数
         # 挂单事件回调（由引擎注入，用于日志记录）；签名为 fn(order_dict)
         self.on_order: Optional[Callable[[dict], None]] = None
 
@@ -72,7 +76,7 @@ class GridBot:
         base_per = min(base_per, bal["base"])
 
         for i in buy_levels:
-            if quote_per > 0:
+            if quote_per > 0 and not self._blocked("buy"):
                 self.orders[i] = {
                     "side": "buy",
                     "price": self.levels[i],
@@ -81,7 +85,7 @@ class GridBot:
                 }
                 self._notify_order(self.orders[i])
         for i in sell_levels:
-            if base_per > 0:
+            if base_per > 0 and not self._blocked("sell"):
                 self.orders[i] = {
                     "side": "sell",
                     "price": self.levels[i],
@@ -89,6 +93,17 @@ class GridBot:
                     "buy_price": price,  # 初始库存以启动价为成本基准
                 }
                 self._notify_order(self.orders[i])
+
+    # ------------------------------------------------------------------
+    def _blocked(self, side: str) -> bool:
+        """趋势信号拦截：偏空(-1)不接买单，偏多(+1)不卖。"""
+        if side == "buy" and self.signal == -1:
+            self.blocked_count += 1
+            return True
+        if side == "sell" and self.signal == 1:
+            self.blocked_count += 1
+            return True
+        return False
 
     # ------------------------------------------------------------------
     def step(
@@ -139,8 +154,8 @@ class GridBot:
 
     # ------------------------------------------------------------------
     def _place_sell(self, idx: int, base_amount: float, buy_price: float) -> None:
-        if idx >= len(self.levels) or idx in self.orders:
-            return  # 超出区间顶部：卖出后不再补单（利润落袋）
+        if idx >= len(self.levels) or idx in self.orders or self._blocked("sell"):
+            return  # 超出区间顶部：卖出后不再补单（利润落袋）；偏多信号：不卖飞
         self.orders[idx] = {
             "side": "sell",
             "price": self.levels[idx],
@@ -150,8 +165,8 @@ class GridBot:
         self._notify_order(self.orders[idx])
 
     def _place_buy(self, idx: int, base_amount: float) -> None:
-        if idx < 0 or idx in self.orders:
-            return  # 超出区间底部：买入后等待即可
+        if idx < 0 or idx in self.orders or self._blocked("buy"):
+            return  # 超出区间底部：买入后等待即可；偏空信号：不接飞刀
         price = self.levels[idx]
         self.orders[idx] = {
             "side": "buy",
@@ -187,6 +202,7 @@ class GridBot:
             "start_price": self.start_price,
             "realized_profit": self.realized_profit,
             "trade_count": self.trade_count,
+            "blocked_count": self.blocked_count,
             "orders": {str(i): o for i, o in self.orders.items()},
             "quote": bal["quote"],
             "base": bal["base"],
@@ -201,6 +217,7 @@ class GridBot:
         bot.start_price = data["start_price"]
         bot.realized_profit = data["realized_profit"]
         bot.trade_count = data["trade_count"]
+        bot.blocked_count = data.get("blocked_count", 0)
         bot.orders = {int(i): o for i, o in data["orders"].items()}
         account.init_pair(data["pair"], data["quote"], data["base"])
         return bot
@@ -223,6 +240,8 @@ class GridBot:
             "pnl": equity - initial_equity,
             "realized_profit": self.realized_profit,
             "trade_count": self.trade_count,
+            "signal": self.signal,
+            "blocked_count": self.blocked_count,
             "orders": [
                 {"side": o["side"], "price": o["price"], "base_amount": o["base_amount"]}
                 for _, o in sorted(list(self.orders.items()))

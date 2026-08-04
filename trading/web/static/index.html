@@ -473,8 +473,10 @@ const STATUS_TEXT = { running: '运行中', paused: '已暂停/待开始', stopp
 const EVENT_TYPE_TEXT = {
   lifecycle: '生命周期', grid_init: '网格初始化', order_placed: '挂单',
   order_filled: '成交', control: '控制', tick_error: '异常', live_order_error: '实盘异常',
-  health: '健康监测',
+  health: '健康监测', grid_recenter: '网格重建', signal_change: '信号翻转',
 };
+const SIGNAL_TEXT = { 1: '偏多·停卖', 0: '中性', '-1': '偏空·停买' };
+const SIGNAL_CLS = { 1: 'up', 0: '', '-1': 'down' };
 
 function render(s) {
   lastState = s;
@@ -562,7 +564,7 @@ function render(s) {
       <td class="side-buy">${buys}</td><td class="side-sell">${sells}</td></tr>`;
   }).join('');
 
-  /* 网格扫描器 */
+  /* 网格扫描器（含指标信号） */
   $('scanRows').innerHTML = Object.values(s.pairs).map(d => {
     const buysBelow = d.orders.filter(o => o.side === 'buy' && o.price < d.price).map(o => o.price);
     const sellsAbove = d.orders.filter(o => o.side === 'sell' && o.price > d.price).map(o => o.price);
@@ -571,6 +573,10 @@ function render(s) {
     const dBuy = nextBuy ? (d.price - nextBuy) / d.price * 100 : null;
     const dSell = nextSell ? (nextSell - d.price) / d.price * 100 : null;
     const pctPos = Math.max(0, Math.min(100, (d.price - d.lower) / (d.upper - d.lower) * 100));
+    const ind = (s.indicators || {})[d.pair] || {};
+    const m = ind.macd || { hist: 0 }, j = ind.kdj || { k: 50, d: 50, j: 50 };
+    const sig = ind.signal || 0;
+    const bookPct = Math.max(0, Math.min(100, (ind.book_ratio || 1) / ((ind.book_ratio || 1) + 1) * 100));
     return `<div class="scan-row">
       <div class="scan-head"><span>${d.pair.replace('_', '/')}</span><span class="mono-num">${fmtPrice(d.price)}</span></div>
       <div class="scan-bar"><div class="cur" style="left:${pctPos}%"></div></div>
@@ -579,6 +585,17 @@ function render(s) {
         <span>上档卖 <b class="mono-num side-sell">${nextSell ? fmtPrice(nextSell) : '无'}</b> ${dSell !== null ? '(+' + fmt(dSell, 2) + '%)' : ''}</span>
       </div>
       <div class="scan-mid"><span>区间 ${fmtPrice(d.lower)}</span><span>~</span><span>${fmtPrice(d.upper)}</span></div>
+      <div class="scan-mid" style="margin-top:3px;border-top:1px dashed #c8c4b4;padding-top:3px">
+        <span>信号 <b class="${SIGNAL_CLS[sig]}">${SIGNAL_TEXT[sig] || '中性'}</b></span>
+        <span>MACD柱 <b class="mono-num ${signCls(m.hist)}">${fmt(m.hist, 6)}</b></span>
+        <span>KDJ <b class="mono-num">${fmt(j.k, 0)}/${fmt(j.d, 0)}/${fmt(j.j, 0)}</b></span>
+      </div>
+      <div class="scan-mid">
+        <span>买卖盘 <b class="mono-num">${fmt(ind.book_ratio, 2)}</b></span>
+        <span style="flex:1;margin:0 6px"><span style="display:inline-block;width:${bookPct}%;height:6px;background:var(--green)"></span><span style="display:inline-block;width:${100 - bookPct}%;height:6px;background:var(--red)"></span></span>
+        <span>主动买 <b class="mono-num">${fmt(ind.trade_ratio, 2)}</b></span>
+      </div>
+      ${d.blocked_count ? `<div class="scan-mid"><span>信号拦截挂单 <b>${d.blocked_count}</b> 次</span></div>` : ''}
     </div>`;
   }).join('');
 

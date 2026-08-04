@@ -32,6 +32,30 @@ class SpotAPI:
         """查询行情 ticker。"""
         return self._c.get("/spot/tickers", {"currency_pair": currency_pair})
 
+    def list_candlesticks(
+        self,
+        currency_pair: str,
+        interval: str = "5m",
+        limit: int = 100,
+    ) -> Any:
+        """查询 K 线。返回 [ts, 成交额, 收盘价, 最高价, 最低价, 开盘价, 成交量, 是否完结]。"""
+        return self._c.get(
+            "/spot/candlesticks",
+            {"currency_pair": currency_pair, "interval": interval, "limit": limit},
+        )
+
+    def list_order_book(self, currency_pair: str, limit: int = 10) -> Any:
+        """查询盘口深度（bids/asks）。"""
+        return self._c.get(
+            "/spot/order_book", {"currency_pair": currency_pair, "limit": limit}
+        )
+
+    def list_public_trades(self, currency_pair: str, limit: int = 100) -> Any:
+        """查询市场最近成交（含主动方向 side）。"""
+        return self._c.get(
+            "/spot/trades", {"currency_pair": currency_pair, "limit": limit}
+        )
+
     # ---- 私有（只读）----
     def list_accounts(self) -> Any:
         """查询现货账户资产。"""
