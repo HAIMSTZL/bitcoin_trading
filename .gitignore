@@ -6,6 +6,15 @@ __pycache__/
 # 交易数据（本地 SQLite，含模拟盘存档）
 trading/data/
 
+# 日志（仅本地保存）
+log/
+
 # 密钥/环境
 .env
 .env.*
+
+# 参考素材（仅供开发参考，不入库）
+demo.png
+
+# macOS
+.DS_Store

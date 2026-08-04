@@ -98,6 +98,7 @@ class Engine:
         self._stopped = False
         self._thread: Optional[threading.Thread] = None
         self._snapshot_counter = 0
+        self._last_health = 0.0  # 首次 tick 即报一条健康状态，之后按间隔
 
         self._init_bots()
         if self.mode == "live":
@@ -271,6 +272,37 @@ class Engine:
                 state["total_equity"], state["total_realized_profit"],
                 {p: s["equity"] for p, s in state["pairs"].items()},
             )
+        self._maybe_health_check()
+
+    # ------------------------------------------------------------------
+    def _maybe_health_check(self) -> None:
+        """每 HEALTH_INTERVAL 秒在运行日志里报一条健康状态。"""
+        now = time.time()
+        if now - self._last_health < config.HEALTH_INTERVAL:
+            return
+        self._last_health = now
+        state = self.state()
+        orders = sum(len(b.orders) for b in self.bots.values())
+        trades = sum(b.trade_count for b in self.bots.values())
+        tick_age = round(now - self.last_tick, 1) if self.last_tick else -1
+        if self.last_error:
+            msg = f"健康检查: 存在异常 {self.last_error}"
+            level = "WARNING"
+        else:
+            msg = (
+                f"运行正常: 总权益 {state['total_equity']:.2f} USDT, "
+                f"已实现利润 {state['total_realized_profit']:.4f}, "
+                f"挂单 {orders} 个, 成交 {trades} 笔, "
+                f"行情 {tick_age}s 前更新"
+            )
+            level = "INFO"
+        log.info("心跳: %s", msg)
+        self._event(level, "health", msg, detail={
+            "total_equity": state["total_equity"],
+            "realized_profit": state["total_realized_profit"],
+            "orders": orders, "trades": trades,
+            "tick_age_sec": tick_age, "last_error": self.last_error,
+        })
 
     # ------------------------------------------------------------------
     def run(self) -> None:

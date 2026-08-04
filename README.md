@@ -60,7 +60,8 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 - **日志（供复盘）**：
   - 结构化事件入库 `trading.db` 的 `events` 表——挂单、成交、网格初始化、启动/暂停/停止
     控制、异常（含堆栈）全覆盖，面板底部"运行日志"区块实时展示；
-  - 文本日志同时写控制台和 `trading/data/trading.log`（轮转，单文件 5MB × 3 备份）；
+  - 文本日志同时写控制台和 `log/` 目录（Logger + 每日 0 点滚动，历史文件按日期命名
+    如 `trading.log.2026-08-04`，保留 30 天；每行含 时间|级别|文件:代码行|模块|内容）；
   - 所有异常（tick 循环、实盘下单、控制接口、引擎初始化）均已捕获并记录，不会静默失败。
 - 实盘风控：币对白名单强制校验 + 单笔 USDT 上限（`MAX_ORDER_QUOTE`，默认 50）。
 
@@ -87,4 +88,4 @@ print(SpotAPI(client).list_accounts())
 print(FuturesAPI(client, settle="usdt").list_positions())
 ```
 
-详细接口清单见 [docs/API.md](docs/API.md)。
+详细接口清单见 [docs/API.md](docs/API.md)，网格交易系统技术方案见 [docs/GRID_TRADING.md](docs/GRID_TRADING.md)。

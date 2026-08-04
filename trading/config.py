@@ -20,6 +20,9 @@ LIVE_CONFIRM = os.environ.get("LIVE_TRADING_CONFIRM", "")
 # ---- 行情轮询间隔（秒）----
 TICK_INTERVAL = float(os.environ.get("TICK_INTERVAL", "3"))
 
+# ---- 健康心跳间隔（秒）：每隔多久在运行日志里报一条"运行正常" ----
+HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "600"))
+
 # ---- 模拟盘仓位 ----
 # true: 模拟盘初始仓位完全镜像真实现货账户（USDT 与各基础币按实际可用余额）；
 # false: 使用下方 GRID_CONFIG 中配置的虚拟 quote_budget / base_budget。
