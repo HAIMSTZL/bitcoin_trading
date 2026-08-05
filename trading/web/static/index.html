@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GATE GRID BOT // 现货网格交易系统</title>
+<title>MSTZL // 现货网格交易系统</title>
 <style>
   :root {
     --bg: #f2efe6;        /* 米色底 */
@@ -30,8 +30,17 @@
     gap: 14px; padding: 7px 12px; border: 2px solid var(--ink);
     box-shadow: 4px 4px 0 rgba(20,22,26,.25); flex-wrap: wrap;
   }
-  .topbar .brand { font-weight: 700; letter-spacing: 1px; }
-  .topbar .brand .sig { color: #9aa0a8; font-weight: 400; }
+  .topbar .brand {
+    font-family: Georgia, "Times New Roman", serif;
+    font-style: italic; font-weight: 700; font-size: 16px; letter-spacing: 4px;
+    color: #e3b341; padding-bottom: 1px;
+    background: linear-gradient(90deg, #3fb950, #2557d6);
+    background-repeat: no-repeat; background-size: 100% 2px; background-position: 0 100%;
+  }
+  .topbar .brand .sig {
+    color: #9aa0a8; font-weight: 400; font-size: 11px; letter-spacing: 1px;
+    font-style: normal; font-family: "SF Mono", Menlo, Consolas, monospace; margin-left: 6px;
+  }
   .chip {
     border: 1px solid #4a4e55; padding: 2px 8px; font-size: 11px;
     display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
@@ -185,7 +194,7 @@
 
 <!-- ===== 顶栏 ===== -->
 <div class="topbar">
-  <span class="brand">GATE GRID BOT <span class="sig">// 现货网格交易系统</span></span>
+  <span class="brand">MSTZL<span class="sig">// 现货网格交易系统</span></span>
   <span class="chip" id="chipMode">…</span>
   <span class="chip"><span class="dot running" id="runDot"></span><b id="runText">…</b></span>
   <span class="chip">权益 <b class="mono-num" id="chipEquity">-</b></span>
