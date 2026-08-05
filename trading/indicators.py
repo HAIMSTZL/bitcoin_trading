@@ -102,18 +102,19 @@ def trade_pressure(trades: list[dict]) -> float:
 
 
 def combine_signal(
-    hist: float, k: float, d: float, ob_ratio: float, trade_ratio: float
+    hist: float, k: float, d: float, ob_ratio: float, trade_ratio: float,
+    ob_th: float = 1.5, tr_th: float = 1.5,
 ) -> tuple[int, str]:
     """汇总为趋势信号：+1 偏多 / 0 中性 / -1 偏空，附中文说明。
 
     用作网格的趋势过滤：偏空时暂停挂买单（不接飞刀），偏多时暂停挂卖单
-    （不卖飞上涨）。中性时双向正常。
+    （不卖飞上涨）。中性时双向正常。ob_th/tr_th 为盘口/主动量比打分阈值。
     """
     score = 0
     score += 1 if hist > 0 else -1                      # MACD 柱方向
     score += 1 if k > d else -1                         # KDJ 金叉/死叉
-    score += 1 if ob_ratio > 1.2 else (-1 if ob_ratio < 0.8 else 0)   # 盘口
-    score += 1 if trade_ratio > 1.2 else (-1 if trade_ratio < 0.8 else 0)  # 主动成交
+    score += 1 if ob_ratio > ob_th else (-1 if ob_ratio < 1 / ob_th else 0)   # 盘口
+    score += 1 if trade_ratio > tr_th else (-1 if trade_ratio < 1 / tr_th else 0)  # 主动成交
     if score >= 2:
         return 1, f"偏多(MACD{'↑' if hist>0 else '↓'} KDJ{'金叉' if k>d else '死叉'} 盘口{ob_ratio:.2f} 主动买{trade_ratio:.2f})"
     if score <= -2:
@@ -123,12 +124,15 @@ def combine_signal(
 
 # ----------------------------------------------------------------------
 class IndicatorEngine:
-    """按周期刷新各币对指标（独立于行情 tick 的低频任务，默认 30s）。"""
+    """按周期刷新各币对指标（独立于行情 tick 的低频任务，默认 120s）。"""
 
-    def __init__(self, spot: SpotAPI, interval: str = "5m", kline_limit: int = 60):
+    def __init__(self, spot: SpotAPI, interval: str = "15m", kline_limit: int = 60,
+                 ob_th: float = 1.5, tr_th: float = 1.5):
         self._spot = spot
         self.interval = interval
         self.kline_limit = kline_limit
+        self.ob_th = ob_th
+        self.tr_th = tr_th
         self.data: dict[str, dict] = {}
         self.last_update: Optional[float] = None
         self.last_error: Optional[str] = None
@@ -154,11 +158,18 @@ class IndicatorEngine:
         j = kdj(highs, lows, closes)
         ob = book_pressure(self._spot.list_order_book(pair, 10))
         tp = trade_pressure(self._spot.list_public_trades(pair, 60))
-        signal, signal_text = combine_signal(m["hist"], j["k"], j["d"], ob, tp)
+        signal, signal_text = combine_signal(
+            m["hist"], j["k"], j["d"], ob, tp, self.ob_th, self.tr_th
+        )
+        # 近 12 根 K 线（15m×12=3h）涨跌幅，用于趋势市识别
+        chg_3h = (
+            (closes[-1] / closes[-13] - 1) * 100 if len(closes) >= 13 else 0.0
+        )
         return {
             "macd": m, "kdj": j,
             "book_ratio": ob, "trade_ratio": tp,
             "atr_pct": atr_percent(candles),
+            "chg_3h": chg_3h,
             "signal": signal, "signal_text": signal_text,
         }
 
@@ -167,5 +178,6 @@ class IndicatorEngine:
             "macd": {"dif": 0, "dea": 0, "hist": 0},
             "kdj": {"k": 50, "d": 50, "j": 50},
             "book_ratio": 1.0, "trade_ratio": 1.0,
+            "atr_pct": 0.0, "chg_3h": 0.0,
             "signal": 0, "signal_text": "暂无数据",
         })

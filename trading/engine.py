@@ -100,10 +100,22 @@ class Engine:
         self._thread: Optional[threading.Thread] = None
         self._snapshot_counter = 0
         self._last_health = 0.0  # 首次 tick 即报一条健康状态，之后按间隔
-        self.indicators = IndicatorEngine(self.spot, interval=config.INDICATOR_KLINE)
+        self.indicators = IndicatorEngine(
+            self.spot, interval=config.INDICATOR_KLINE,
+            ob_th=config.DEPTH_RATIO_THRESHOLD, tr_th=config.TRADE_RATIO_THRESHOLD,
+        )
         self._last_indicator = 0.0
-        self._last_signals: dict[str, int] = {}  # 各币对上一次信号，用于变更事件
+        self._last_signals: dict[str, int] = {}  # 各币对上一次【已确认】信号
+        self._signal_buf: dict[str, list[int]] = {p: [] for p in config.PAIRS}  # 确认缓冲
+        self._last_flip: dict[str, float] = {}  # 各币对上次信号翻转时间（冷却用）
+        self._regimes: dict[str, str] = {}  # 各币对行情状态 ranging/trend_up/trend_down
         self._last_rebalance = time.time()  # 启动后过完整周期才首次再平衡
+        self._init_atr: dict[str, float] = {}  # 建仓时的 ATR%（自适应区间兜底）
+        # 熔断状态
+        self._price_hist: dict[str, list[tuple[float, float]]] = {p: [] for p in config.PAIRS}
+        self._cb_pairs: dict[str, float] = {}   # 被熔断的币对 -> 熔断时刻
+        self._cb_low: dict[str, list[float]] = {}  # 币对 -> [最低价, 最近创新低时间]
+        self._cb_global = False  # 大盘熔断（BTC 触发，全系统停止撮合）
 
         self._init_bots()
         if self.mode == "live":
@@ -141,6 +153,7 @@ class Engine:
                     for pair in config.PAIRS:
                         bot = GridBot.from_dict(saved[pair], self.account)
                         bot.on_order = self._on_order_placed
+                        bot.fee_rate = config.PAPER_FEE_RATE
                         self.bots[pair] = bot
                     log.info(
                         "已恢复上次模拟盘状态: %s",
@@ -165,6 +178,7 @@ class Engine:
                     bot.realized_profit = d.get("realized_profit", 0.0)
                     bot.trade_count = d.get("trade_count", 0)
                     bot.blocked_count = d.get("blocked_count", 0)
+                    bot.total_fees = d.get("total_fees", 0.0)
                     self.bots[pair] = bot
                 return
             log.info("未找到模拟盘存档，按初始仓位新建网格")
@@ -189,25 +203,39 @@ class Engine:
             for p in config.PAIRS
         }
 
+    def _desired_range_pct(self, pair: str) -> float:
+        """当前应有的网格区间幅度：ADAPTIVE_RANGE 开启时随 ATR% 自适应。"""
+        cfg = config.GRID_CONFIG[pair]
+        if not config.ADAPTIVE_RANGE:
+            return cfg["range_pct"]
+        atr = self.indicators.get(pair).get("atr_pct", 0.0) or self._init_atr.get(pair, 0.0)
+        if atr <= 0:
+            return cfg["range_pct"]
+        return min(max(config.ADAPTIVE_RANGE_MULT * atr / 100,
+                       config.RANGE_PCT_MIN), config.RANGE_PCT_MAX)
+
     def _build_bot(
         self, pair: str, price: float, quote_budget: float, base_budget: float
     ) -> GridBot:
         cfg = config.GRID_CONFIG[pair]
-        lower = price * (1 - cfg["range_pct"])
-        upper = price * (1 + cfg["range_pct"])
-        bot = GridBot(pair, lower, upper, cfg["grids"], quote_budget, base_budget)
+        range_pct = self._desired_range_pct(pair)
+        lower = price * (1 - range_pct)
+        upper = price * (1 + range_pct)
+        bot = GridBot(pair, lower, upper, cfg["grids"], quote_budget, base_budget,
+                      fee_rate=config.PAPER_FEE_RATE)
         bot.on_order = self._on_order_placed  # 先挂监听器，捕获初始挂单
         bot.start(price, self.account)
         log.info(
-            "网格已启动 %s: 区间 %.6g ~ %.6g, %d 档, 挂单 %d 个",
-            pair, lower, upper, cfg["grids"], len(bot.orders),
+            "网格已启动 %s: 区间 %.6g ~ %.6g (±%.2f%%), %d 档, 挂单 %d 个",
+            pair, lower, upper, range_pct * 100, cfg["grids"], len(bot.orders),
         )
         self._event(
             "INFO", "grid_init",
-            f"新建网格: 区间 {lower:.6g} ~ {upper:.6g}, {cfg['grids']} 档, "
+            f"新建网格: 区间 {lower:.6g} ~ {upper:.6g} (±{range_pct*100:.2f}%), {cfg['grids']} 档, "
             f"挂单 {len(bot.orders)} 个, USDT={quote_budget:.4f}, 基础币={base_budget:.4f}",
             pair=pair,
             detail={"lower": lower, "upper": upper, "grids": cfg["grids"],
+                    "range_pct": range_pct,
                     "quote_budget": quote_budget, "base_budget": base_budget,
                     "start_price": price},
         )
@@ -221,6 +249,7 @@ class Engine:
         bot.realized_profit = old.realized_profit
         bot.trade_count = old.trade_count
         bot.blocked_count = old.blocked_count
+        bot.total_fees = old.total_fees
         self.bots[pair] = bot
         log.warning("%s 价格 %.6g 跑出区间 [%.6g, %.6g]，网格已重建", pair, price, old.lower, old.upper)
         self._event(
@@ -272,6 +301,7 @@ class Engine:
                 vols[pair] = atr_percent(candles)
             if sum(vols.values()) <= 0:
                 raise ValueError("ATR 全为 0")
+            self._init_atr = vols  # 供自适应区间在建仓时使用
             weights = {p: v / sum(vols.values()) for p, v in vols.items()}
             # 夹紧到 [MIN, MAX] 后按剩余比例再分配（两轮收敛即可）
             for _ in range(2):
@@ -361,9 +391,13 @@ class Engine:
 
     def tick(self) -> None:
         self.prices = self._fetch_prices()
+        self._check_circuit_breaker()  # 熔断检测永远运行（含熔断期间，用于企稳恢复）
         self._update_indicators()
-        self._maybe_rebalance()
+        if not self._cb_global:
+            self._maybe_rebalance()
         for pair, bot in self.bots.items():
+            if self._cb_global or pair in self._cb_pairs:
+                continue  # 熔断中：不撮合、不补单
             price = self.prices.get(pair)
             if not price:
                 continue
@@ -384,8 +418,74 @@ class Engine:
         self._maybe_health_check()
 
     # ------------------------------------------------------------------
+    # 熔断机制
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _window_drop(hist: list[tuple[float, float]], now: float, window_sec: float) -> float:
+        """窗口内从最高点的回撤百分比。数据不足返回 0。"""
+        recent = [p for t, p in hist if t >= now - window_sec]
+        if len(recent) < 2:
+            return 0.0
+        high = max(recent)
+        return (high - recent[-1]) / high * 100 if high > 0 else 0.0
+
+    def _check_circuit_breaker(self) -> None:
+        if not config.CB_ENABLED:
+            return
+        now = time.time()
+        window = config.CB_WINDOW_MIN * 60
+        stable = config.CB_RESUME_STABLE_MIN * 60
+        for pair, price in self.prices.items():
+            hist = self._price_hist[pair]
+            hist.append((now, price))
+            cutoff = now - max(window, stable) - 60  # 保留到恢复判定所需长度
+            while hist and hist[0][0] < cutoff:
+                hist.pop(0)
+
+            if pair in self._cb_pairs:
+                # 熔断中：跟踪是否企稳（不再创新低）
+                low = self._cb_low[pair]
+                if price < low[0]:
+                    low[0], low[1] = price, now
+                if config.CB_AUTO_RESUME and now - low[1] >= stable:
+                    del self._cb_pairs[pair]
+                    del self._cb_low[pair]
+                    log.warning("%s 熔断恢复：已 %d 分钟未创新低，现价 %.6g",
+                                pair, config.CB_RESUME_STABLE_MIN, price)
+                    self._event("INFO", "circuit_resume",
+                                f"熔断恢复：{config.CB_RESUME_STABLE_MIN:.0f} 分钟未创新低，恢复交易",
+                                pair=pair, detail={"price": price})
+                    if pair == "BTC_USDT" and self._cb_global:
+                        self._cb_global = False
+                        log.warning("大盘熔断恢复，全系统恢复撮合")
+                        self._event("INFO", "circuit_resume",
+                                    "大盘熔断恢复（BTC 企稳），全系统恢复交易")
+                continue
+
+            drop = self._window_drop(hist, now, window)
+            is_btc = pair == "BTC_USDT"
+            threshold = config.CB_GLOBAL_BTC_PCT if is_btc else config.CB_DROP_PCT
+            if drop >= threshold:
+                self._cb_pairs[pair] = now
+                self._cb_low[pair] = [price, now]
+                log.warning("%s 触发熔断: %d 分钟内回撤 %.2f%% (阈值 %.1f%%), 现价 %.6g",
+                            pair, config.CB_WINDOW_MIN, drop, threshold, price)
+                self._event("WARNING", "circuit_breaker",
+                            f"触发熔断: {config.CB_WINDOW_MIN:.0f} 分钟回撤 {drop:.2f}%"
+                            f"（阈值 {threshold:.1f}%），冻结该币对交易",
+                            pair=pair,
+                            detail={"drop_pct": drop, "threshold": threshold, "price": price})
+                if is_btc:
+                    self._cb_global = True
+                    log.warning("大盘熔断: BTC 回撤 %.2f%%，全系统停止撮合", drop)
+                    self._event("ERROR", "circuit_breaker",
+                                f"大盘熔断: BTC {config.CB_WINDOW_MIN:.0f} 分钟回撤 {drop:.2f}%，"
+                                f"全系统停止交易，等待企稳",
+                                detail={"drop_pct": drop, "price": price})
+
+    # ------------------------------------------------------------------
     def _update_indicators(self) -> None:
-        """按周期刷新指标，写入各网格的趋势信号，信号翻转时记录事件。"""
+        """按周期刷新指标，确认信号后写入各网格，信号翻转/行情切换时记录事件。"""
         now = time.time()
         if now - self._last_indicator < config.INDICATOR_INTERVAL:
             return
@@ -393,10 +493,29 @@ class Engine:
         self.indicators.update(config.PAIRS)
         for pair in config.PAIRS:
             ind = self.indicators.get(pair)
-            sig = ind["signal"] if config.USE_SIGNAL_FILTER else 0
+            raw_sig = ind["signal"] if config.USE_SIGNAL_FILTER else 0
+            sig = self._confirm_signal(pair, raw_sig)  # 迟滞确认后的信号
             bot = self.bots.get(pair)
             if bot:
                 bot.signal = sig
+            self._update_regime(pair, sig, ind)
+            # 每次指标刷新都检查挂单耗尽（信号解封/启动恢复后"熄火"的网格补挂）
+            price = self.prices.get(pair)
+            if bot and price:
+                if sig != -1 and not any(
+                        o["side"] == "buy" for o in bot.orders.values()):
+                    bot.rebuild_buys(price, self.account)
+                    n = sum(1 for o in bot.orders.values() if o["side"] == "buy")
+                    if n:
+                        self._event("INFO", "order_placed",
+                                    f"买单侧耗尽，补挂 {n} 个", pair=pair)
+                if sig != 1 and not any(
+                        o["side"] == "sell" for o in bot.orders.values()):
+                    bot.rebuild_sells(price, self.account)
+                    n = sum(1 for o in bot.orders.values() if o["side"] == "sell")
+                    if n:
+                        self._event("INFO", "order_placed",
+                                    f"卖单侧耗尽，补挂 {n} 个", pair=pair)
             if pair in self._last_signals and self._last_signals[pair] != sig:
                 names = {1: "偏多(暂停卖单)", 0: "中性(双向挂单)", -1: "偏空(暂停买单)"}
                 log.info("%s 趋势信号翻转: %s -> %s | %s",
@@ -409,6 +528,51 @@ class Engine:
                     detail={"from": self._last_signals[pair], "to": sig, **ind},
                 )
             self._last_signals[pair] = sig
+
+    def _confirm_signal(self, pair: str, raw: int) -> int:
+        """信号迟滞确认：连续 SIGNAL_CONFIRM_COUNT 次同向才翻转，
+        且两次翻转间隔不小于 SIGNAL_COOLDOWN 秒。抖动期间保持原信号。"""
+        cur = self._last_signals.get(pair, 0)
+        if raw == cur:
+            self._signal_buf[pair] = []
+            return cur
+        buf = self._signal_buf[pair]
+        buf.append(raw)
+        del buf[:-config.SIGNAL_CONFIRM_COUNT]
+        if len(buf) < config.SIGNAL_CONFIRM_COUNT or len(set(buf)) != 1:
+            return cur  # 确认次数不足
+        now = time.time()
+        if now - self._last_flip.get(pair, 0) < config.SIGNAL_COOLDOWN:
+            return cur  # 冷却期内
+        self._last_flip[pair] = now
+        self._signal_buf[pair] = []
+        return raw
+
+    def _update_regime(self, pair: str, sig: int, ind: dict) -> None:
+        """趋势市识别：确认信号同向 + 3h 涨跌幅超阈值 → 趋势市。"""
+        chg = ind.get("chg_3h", 0.0)
+        if sig == -1 and chg <= -config.TREND_MOVE_PCT:
+            regime = "trend_down"
+        elif sig == 1 and chg >= config.TREND_MOVE_PCT:
+            regime = "trend_up"
+        else:
+            regime = "ranging"
+        bot = self.bots.get(pair)
+        if bot:
+            bot.regime = regime
+        prev = self._regimes.get(pair)
+        if prev is not None and prev != regime:
+            names = {"ranging": "震荡市", "trend_up": "趋势上涨(冻结卖单)",
+                     "trend_down": "趋势下跌(冻结买单)"}
+            log.warning("%s 行情状态切换: %s -> %s (3h涨跌 %.2f%%)",
+                        pair, names.get(prev), names.get(regime), chg)
+            self._event(
+                "WARNING" if regime != "ranging" else "INFO", "regime_change",
+                f"行情切换: {names.get(prev)} → {names.get(regime)} · 3h涨跌 {chg:+.2f}% · {ind['signal_text']}",
+                pair=pair,
+                detail={"from": prev, "to": regime, "chg_3h": chg, **ind},
+            )
+        self._regimes[pair] = regime
 
     # ------------------------------------------------------------------
     def _maybe_rebalance(self) -> None:
@@ -450,11 +614,39 @@ class Engine:
             return
 
         # 执行：重设各币对 USDT = 池子×权重（总额守恒），并按新预算重建买单侧
+        # 同步记账资金调拨（capital_adjust），避免盈亏基准被调拨污染
         for pair in config.PAIRS:
-            self.account.get(pair)["quote"] = pool * weights[pair]
+            old_q = self.account.get(pair)["quote"]
+            new_q = pool * weights[pair]
+            self.account.get(pair)["quote"] = new_q
+            bot = self.bots.get(pair)
+            if bot:
+                bot.capital_adjust += new_q - old_q
         for pair, bot in self.bots.items():
             price = self.prices.get(pair)
-            if price:
+            if not price:
+                continue
+            # 自适应区间漂移超过 50%：整个网格按新区间重建（保留利润累计）
+            desired = self._desired_range_pct(pair)
+            current_range = (bot.upper - bot.lower) / 2 / (bot.start_price or price)
+            if abs(desired - current_range) / max(current_range, 1e-9) > 0.5:
+                old = bot
+                bal = self.account.get(pair)
+                bot = self._build_bot(pair, price, bal["quote"], bal["base"])
+                bot.realized_profit = old.realized_profit
+                bot.trade_count = old.trade_count
+                bot.blocked_count = old.blocked_count
+                bot.total_fees = old.total_fees
+                # 重建后新基准已含调拨资金，调整量清零
+                bot.capital_adjust = 0.0
+                self.bots[pair] = bot
+                self._event(
+                    "INFO", "grid_recenter",
+                    f"波动率变化，区间自适应调整 ±{current_range*100:.2f}% → ±{desired*100:.2f}%",
+                    pair=pair,
+                    detail={"old_range": current_range, "new_range": desired},
+                )
+            else:
                 bot.rebuild_buys(price, self.account)
 
         moves = {p: round(d, 2) for p, d in deltas.items() if abs(d) >= 0.01}
@@ -579,15 +771,20 @@ class Engine:
 
     # ------------------------------------------------------------------
     def state(self) -> dict[str, Any]:
-        pairs = {
-            pair: bot.state(self.prices.get(pair, bot.start_price or 0), self.account)
-            for pair, bot in self.bots.items()
-        }
+        pairs = {}
+        for pair, bot in self.bots.items():
+            s = bot.state(self.prices.get(pair, bot.start_price or 0), self.account)
+            s["frozen"] = self._cb_global or pair in self._cb_pairs
+            pairs[pair] = s
         total_equity = sum(s["equity"] for s in pairs.values())
         total_initial = sum(s["initial_equity"] for s in pairs.values())
         return {
             "mode": self.mode,
             "run_status": self.run_status,
+            "circuit_breaker": {
+                "global": self._cb_global,
+                "pairs": sorted(self._cb_pairs.keys()),
+            },
             "started_at": self.started_at,
             "last_tick": self.last_tick,
             "last_error": self.last_error,
@@ -595,6 +792,7 @@ class Engine:
             "total_initial_equity": total_initial,
             "total_pnl": total_equity - total_initial,
             "total_realized_profit": sum(s["realized_profit"] for s in pairs.values()),
+            "total_fees": sum(s["total_fees"] for s in pairs.values()),
             "pairs": pairs,
             "indicators": {p: self.indicators.get(p) for p in config.PAIRS},
             "signal_filter": config.USE_SIGNAL_FILTER,

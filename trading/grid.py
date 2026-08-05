@@ -34,6 +34,7 @@ class GridBot:
         grids: int,
         quote_budget: float,
         base_budget: float,
+        fee_rate: float = 0.0,
     ):
         if not (lower > 0 and upper > lower and grids >= 3):
             raise ValueError("非法网格参数")
@@ -44,12 +45,18 @@ class GridBot:
         self.levels = [lower + step * i for i in range(grids)]
         self.quote_budget = quote_budget
         self.base_budget = base_budget
+        self.fee_rate = fee_rate  # 单边手续费率（模拟盘按成交金额扣）
 
         # idx -> 挂单 {side, price, quote_amount, base_amount, buy_price}
         self.orders: dict[int, dict[str, Any]] = {}
         self.start_price: Optional[float] = None
-        self.realized_profit = 0.0  # USDT 口径
+        self.realized_profit = 0.0  # USDT 口径（已扣手续费）
         self.trade_count = 0
+        self.total_fees = 0.0  # 累计手续费（USDT）
+        self.regime = "ranging"  # 行情状态（引擎写入）：ranging/trend_up/trend_down
+        # 再平衡资金调拨累计（USDT 净流入）：盈亏基准随之调整，
+        # 避免资金调拨被误计为交易亏损（引擎在再平衡时写入）
+        self.capital_adjust = 0.0
         # 趋势信号（引擎每个 tick 写入）：+1 偏多 / 0 中性 / -1 偏空
         # 偏空暂停挂买单（不接飞刀），偏多暂停挂卖单（不卖飞）
         self.signal = 0
@@ -122,29 +129,36 @@ class GridBot:
             if order["side"] == "buy" and price <= order["price"]:
                 if bal["quote"] + 1e-12 < order["quote_amount"]:
                     continue  # 预算已用尽，挂单保留等待（模拟盘一般不会发生）
+                fee = order["quote_amount"] * self.fee_rate
+                base_got = (order["quote_amount"] - fee) / order["price"]
+                self.total_fees += fee
                 bal["quote"] -= order["quote_amount"]
-                bal["base"] += order["base_amount"]
+                bal["base"] += base_got
                 del self.orders[idx]
                 fill = {
                     "pair": self.pair, "side": "buy", "price": order["price"],
-                    "amount": order["base_amount"], "quote": order["quote_amount"],
-                    "profit": 0.0,
+                    "amount": base_got, "quote": order["quote_amount"],
+                    "profit": 0.0, "fee": fee,
                 }
                 self._on_fill(fill, record, fills)
                 # 上一档挂出卖单
-                self._place_sell(idx + 1, order["base_amount"], order["price"])
+                self._place_sell(idx + 1, base_got, order["price"])
             elif order["side"] == "sell" and price >= order["price"]:
                 if bal["base"] + 1e-12 < order["base_amount"]:
                     continue
-                proceeds = order["base_amount"] * order["price"]
+                gross = order["base_amount"] * order["price"]
+                fee = gross * self.fee_rate
+                proceeds = gross - fee
+                self.total_fees += fee
                 bal["base"] -= order["base_amount"]
                 bal["quote"] += proceeds
-                profit = order["base_amount"] * (order["price"] - order.get("buy_price", order["price"]))
+                profit = proceeds - order["base_amount"] * order.get("buy_price", order["price"])
                 self.realized_profit += profit
                 del self.orders[idx]
                 fill = {
                     "pair": self.pair, "side": "sell", "price": order["price"],
-                    "amount": order["base_amount"], "quote": proceeds, "profit": profit,
+                    "amount": order["base_amount"], "quote": proceeds,
+                    "profit": profit, "fee": fee,
                 }
                 self._on_fill(fill, record, fills)
                 # 下一档挂回买单
@@ -180,6 +194,25 @@ class GridBot:
                     "price": self.levels[i],
                     "quote_amount": quote_per,
                     "base_amount": quote_per / self.levels[i],
+                }
+                self._notify_order(self.orders[i])
+
+    def rebuild_sells(self, price: float, account: PaperAccount) -> None:
+        """重建卖单侧（买单保持不变）：信号解封后补挂。成本基准以现价计。"""
+        self.orders = {i: o for i, o in self.orders.items() if o["side"] != "sell"}
+        bal = account.get(self.pair)
+        sell_levels = [i for i, p in enumerate(self.levels)
+                       if p > price and i not in self.orders]
+        if not sell_levels:
+            return
+        base_per = bal["base"] / len(sell_levels)
+        for i in sell_levels:
+            if base_per > 0 and not self._blocked("sell"):
+                self.orders[i] = {
+                    "side": "sell",
+                    "price": self.levels[i],
+                    "base_amount": base_per,
+                    "buy_price": price,  # 以现价为成本基准
                 }
                 self._notify_order(self.orders[i])
 
@@ -222,6 +255,8 @@ class GridBot:
             "realized_profit": self.realized_profit,
             "trade_count": self.trade_count,
             "blocked_count": self.blocked_count,
+            "total_fees": self.total_fees,
+            "capital_adjust": self.capital_adjust,
             "orders": {str(i): o for i, o in self.orders.items()},
             "quote": bal["quote"],
             "base": bal["base"],
@@ -237,6 +272,8 @@ class GridBot:
         bot.realized_profit = data["realized_profit"]
         bot.trade_count = data["trade_count"]
         bot.blocked_count = data.get("blocked_count", 0)
+        bot.total_fees = data.get("total_fees", 0.0)
+        bot.capital_adjust = data.get("capital_adjust", 0.0)
         bot.orders = {int(i): o for i, o in data["orders"].items()}
         account.init_pair(data["pair"], data["quote"], data["base"])
         return bot
@@ -245,7 +282,8 @@ class GridBot:
     def state(self, price: float, account: PaperAccount) -> dict:
         bal = account.get(self.pair)
         equity = bal["quote"] + bal["base"] * price
-        initial_equity = self.quote_budget + self.base_budget * (self.start_price or price)
+        initial_equity = (self.quote_budget + self.capital_adjust
+                          + self.base_budget * (self.start_price or price))
         return {
             "pair": self.pair,
             "price": price,
@@ -260,7 +298,9 @@ class GridBot:
             "realized_profit": self.realized_profit,
             "trade_count": self.trade_count,
             "signal": self.signal,
+            "regime": self.regime,
             "blocked_count": self.blocked_count,
+            "total_fees": self.total_fees,
             "orders": [
                 {"side": o["side"], "price": o["price"], "base_amount": o["base_amount"]}
                 for _, o in sorted(list(self.orders.items()))

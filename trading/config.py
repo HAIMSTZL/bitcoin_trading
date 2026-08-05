@@ -65,9 +65,43 @@ GRID_CONFIG: dict = {
 #       偏多时暂停挂卖单（不卖飞）；false: 不使用信号，双向正常挂单。
 USE_SIGNAL_FILTER = os.environ.get("USE_SIGNAL_FILTER", "true").lower() == "true"
 # 指标刷新周期（秒），独立于行情 tick（K线+盘口+逐笔 3 个接口/币对/次）
-INDICATOR_INTERVAL = float(os.environ.get("INDICATOR_INTERVAL", "30"))
+INDICATOR_INTERVAL = float(os.environ.get("INDICATOR_INTERVAL", "120"))
 # 指标所用 K 线周期
-INDICATOR_KLINE = os.environ.get("INDICATOR_KLINE", "5m")
+INDICATOR_KLINE = os.environ.get("INDICATOR_KLINE", "15m")
+# 盘口买卖量比 / 主动买卖量比的打分阈值（±20% 太敏感，放宽到 ±50%）
+DEPTH_RATIO_THRESHOLD = float(os.environ.get("DEPTH_RATIO_THRESHOLD", "1.5"))
+TRADE_RATIO_THRESHOLD = float(os.environ.get("TRADE_RATIO_THRESHOLD", "1.5"))
+# 信号确认：连续 N 次同向才翻转 + 翻转后冷却期（秒）内不再翻转（防抖）
+SIGNAL_CONFIRM_COUNT = int(os.environ.get("SIGNAL_CONFIRM_COUNT", "2"))
+SIGNAL_COOLDOWN = float(os.environ.get("SIGNAL_COOLDOWN", "180"))
+
+# ---- 模拟盘手续费 ----
+# 每笔成交按成交金额扣除该费率（单边），让模拟盘利润接近实盘
+PAPER_FEE_RATE = float(os.environ.get("PAPER_FEE_RATE", "0.001"))
+
+# ---- 自适应网格区间 ----
+# true: 网格区间不再固定，range = clamp(ADAPTIVE_RANGE_MULT × ATR%, MIN, MAX)
+#       波动大自动加宽间距（每格利润厚、成交少而稳），波动小自动收窄。
+ADAPTIVE_RANGE = os.environ.get("ADAPTIVE_RANGE", "true").lower() == "true"
+ADAPTIVE_RANGE_MULT = float(os.environ.get("ADAPTIVE_RANGE_MULT", "10"))
+RANGE_PCT_MIN = float(os.environ.get("RANGE_PCT_MIN", "0.02"))
+RANGE_PCT_MAX = float(os.environ.get("RANGE_PCT_MAX", "0.15"))
+
+# ---- 趋势市识别 ----
+# 3 小时涨跌幅超过该值且确认信号同向 = 趋势市：
+# 趋势下跌→冻结买单（握 USDT 等待）；趋势上涨→冻结卖单（握住筹码）。
+TREND_MOVE_PCT = float(os.environ.get("TREND_MOVE_PCT", "4.0"))
+
+# ---- 熔断机制（tick 级快速断路器）----
+# 单币对：现价相对 CB_WINDOW_MIN 分钟窗口内最高点回撤 ≥ CB_DROP_PCT% → 冻结该币对双侧挂单；
+# 大盘：BTC 同窗口回撤 ≥ CB_GLOBAL_BTC_PCT% → 全系统停止撮合（行情与熔断检测继续运行）。
+# 企稳判定：不再创新低持续 CB_RESUME_STABLE_MIN 分钟 → 自动恢复（CB_AUTO_RESUME）。
+CB_ENABLED = os.environ.get("CB_ENABLED", "true").lower() == "true"
+CB_DROP_PCT = float(os.environ.get("CB_DROP_PCT", "3.0"))
+CB_WINDOW_MIN = float(os.environ.get("CB_WINDOW_MIN", "15"))
+CB_GLOBAL_BTC_PCT = float(os.environ.get("CB_GLOBAL_BTC_PCT", "4.0"))
+CB_AUTO_RESUME = os.environ.get("CB_AUTO_RESUME", "true").lower() == "true"
+CB_RESUME_STABLE_MIN = float(os.environ.get("CB_RESUME_STABLE_MIN", "30"))
 
 # ---- 网格自动重建 ----
 # true: 价格涨破/跌破网格区间时，以当前价格为中心自动重建网格（保留持仓与利润累计）

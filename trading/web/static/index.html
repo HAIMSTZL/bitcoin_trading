@@ -222,7 +222,7 @@
         <div class="cell"><div class="k">已实现利润</div><div class="v mono-num" id="wRealized">-</div></div>
         <div class="cell"><div class="k">成交笔数</div><div class="v mono-num" id="wTrades">-</div></div>
         <div class="cell"><div class="k">当前挂单</div><div class="v mono-num" id="wOrders">-</div></div>
-        <div class="cell"><div class="k">网格层数</div><div class="v mono-num" id="wGrids">-</div></div>
+        <div class="cell"><div class="k">累计手续费</div><div class="v mono-num" id="wFees">-</div></div>
       </div>
     </div>
   </div>
@@ -557,10 +557,13 @@ const EVENT_TYPE_TEXT = {
   lifecycle: '生命周期', grid_init: '网格初始化', order_placed: '挂单',
   order_filled: '成交', control: '控制', tick_error: '异常', live_order_error: '实盘异常',
   health: '健康监测', grid_recenter: '网格重建', signal_change: '信号翻转',
-  rebalance: '再平衡',
+  rebalance: '再平衡', regime_change: '行情切换',
+  circuit_breaker: '⛔ 熔断', circuit_resume: '✅ 熔断恢复',
 };
 const SIGNAL_TEXT = { 1: '偏多·停卖', 0: '中性', '-1': '偏空·停买' };
 const SIGNAL_CLS = { 1: 'up', 0: '', '-1': 'down' };
+const REGIME_TEXT = { ranging: '震荡市', trend_up: '趋势↑·停卖', trend_down: '趋势↓·停买' };
+const REGIME_CLS = { ranging: '', trend_up: 'up', trend_down: 'down' };
 
 function render(s) {
   lastState = s;
@@ -581,7 +584,11 @@ function render(s) {
   /* 状态栏 */
   $('stStart').textContent = new Date(s.started_at * 1000).toLocaleString();
   $('stTick').textContent = s.last_tick ? new Date(s.last_tick * 1000).toLocaleTimeString() : '-';
-  $('stErr').innerHTML = s.last_error ? `<span class="err">⚠ 异常: ${s.last_error}</span>` : '';
+  const cb = s.circuit_breaker || { global: false, pairs: [] };
+  let cbHtml = '';
+  if (cb.global) cbHtml = '<span class="err">⛔ 大盘熔断中：全系统停止交易，等待 BTC 企稳</span>';
+  else if (cb.pairs && cb.pairs.length) cbHtml = `<span class="err">⛔ 熔断中: ${cb.pairs.join(', ')}</span>`;
+  $('stErr').innerHTML = cbHtml || (s.last_error ? `<span class="err">⚠ 异常: ${s.last_error}</span>` : '');
 
   /* 累积历史 */
   const t = s.last_tick || Date.now() / 1000;
@@ -621,7 +628,7 @@ function render(s) {
   $('wRealized').className = 'v mono-num ' + signCls(s.total_realized_profit);
   $('wTrades').textContent = Object.values(s.pairs).reduce((a, p) => a + p.trade_count, 0);
   $('wOrders').textContent = Object.values(s.pairs).reduce((a, p) => a + p.orders.length, 0);
-  $('wGrids').textContent = Object.values(s.pairs).map(p => p.levels.length).join('/');
+  $('wFees').textContent = fmt(s.total_fees || 0, 4);
   drawSpark($('wSpark'), eqHist.map(p => p.equity), '#1a7f37', true);
 
   /* 价格监控 */
@@ -662,7 +669,7 @@ function render(s) {
     const sig = ind.signal || 0;
     const bookPct = Math.max(0, Math.min(100, (ind.book_ratio || 1) / ((ind.book_ratio || 1) + 1) * 100));
     return `<div class="scan-row">
-      <div class="scan-head"><span>${d.pair.replace('_', '/')}</span><span class="mono-num">${fmtPrice(d.price)}</span></div>
+      <div class="scan-head"><span>${d.pair.replace('_', '/')} <b class="${REGIME_CLS[d.regime] || ''}" style="font-size:10px">${REGIME_TEXT[d.regime] || '震荡市'}</b>${d.frozen ? ' <b class="down" style="font-size:10px">⛔熔断</b>' : ''}</span><span class="mono-num">${fmtPrice(d.price)}</span></div>
       <div class="scan-bar"><div class="cur" style="left:${pctPos}%"></div></div>
       <div class="scan-mid">
         <span>下档买 <b class="mono-num side-buy">${nextBuy ? fmtPrice(nextBuy) : '无'}</b> ${dBuy !== null ? '(-' + fmt(dBuy, 2) + '%)' : ''}</span>
