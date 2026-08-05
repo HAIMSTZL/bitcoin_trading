@@ -103,6 +103,10 @@ CB_GLOBAL_BTC_PCT = float(os.environ.get("CB_GLOBAL_BTC_PCT", "4.0"))
 CB_AUTO_RESUME = os.environ.get("CB_AUTO_RESUME", "true").lower() == "true"
 CB_RESUME_STABLE_MIN = float(os.environ.get("CB_RESUME_STABLE_MIN", "30"))
 
+# ---- API 中断告警 ----
+# 连续失败超过该秒数 → ERROR 事件 + 面板横幅；恢复后记 api_recovered 事件
+API_OUTAGE_ALERT_SEC = float(os.environ.get("API_OUTAGE_ALERT_SEC", "30"))
+
 # ---- 网格自动重建 ----
 # true: 价格涨破/跌破网格区间时，以当前价格为中心自动重建网格（保留持仓与利润累计）
 AUTO_RECENTER = os.environ.get("AUTO_RECENTER", "true").lower() == "true"

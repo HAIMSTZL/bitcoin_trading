@@ -116,6 +116,9 @@ class Engine:
         self._cb_pairs: dict[str, float] = {}   # 被熔断的币对 -> 熔断时刻
         self._cb_low: dict[str, list[float]] = {}  # 币对 -> [最低价, 最近创新低时间]
         self._cb_global = False  # 大盘熔断（BTC 触发，全系统停止撮合）
+        # API 中断告警状态
+        self._last_success: Optional[float] = None  # 最近一次成功 tick 时间
+        self._api_outage = False  # 是否处于持续中断告警状态
 
         self._init_bots()
         if self.mode == "live":
@@ -702,11 +705,28 @@ class Engine:
             try:
                 self.tick()
                 self.last_error = None
+                self._last_success = time.time()
+                if self._api_outage:
+                    self._api_outage = False
+                    log.warning("API 连接已恢复")
+                    self._event("INFO", "api_recovered", "API 连接已恢复，交易继续")
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
                 log.exception("tick 失败")
                 self._event("ERROR", "tick_error", self.last_error,
                             detail={"traceback": traceback.format_exc()})
+                # 持续中断超过阈值 → 升级告警（只报一次，恢复时再报）
+                if (self._last_success
+                        and time.time() - self._last_success > config.API_OUTAGE_ALERT_SEC
+                        and not self._api_outage):
+                    self._api_outage = True
+                    log.error("API 持续中断超过 %ds", config.API_OUTAGE_ALERT_SEC)
+                    self._event(
+                        "ERROR", "api_outage",
+                        f"API 持续中断超过 {config.API_OUTAGE_ALERT_SEC:.0f} 秒！"
+                        f"最近错误: {self.last_error}。系统将持续重试，恢复后自动继续。",
+                        detail={"last_error": self.last_error},
+                    )
             self._stop.wait(config.TICK_INTERVAL)
 
     def start_background(self) -> None:
@@ -785,6 +805,8 @@ class Engine:
                 "global": self._cb_global,
                 "pairs": sorted(self._cb_pairs.keys()),
             },
+            "api_outage": self._api_outage,
+            "last_success": self._last_success,
             "started_at": self.started_at,
             "last_tick": self.last_tick,
             "last_error": self.last_error,

@@ -59,6 +59,7 @@ class GateClient:
         # 直连不可达的网络环境可设 GATE_USE_PROXY=true 走系统代理。
         if use_proxy is None:
             use_proxy = os.environ.get("GATE_USE_PROXY", "").lower() in ("1", "true", "yes")
+        self._use_proxy = use_proxy
         self.session.trust_env = use_proxy
 
     # ------------------------------------------------------------------
@@ -114,13 +115,25 @@ class GateClient:
         if query_string:
             url = f"{url}?{query_string}"
 
-        resp = self.session.request(
-            method.upper(),
-            url,
-            data=body_str if body_str else None,
-            headers=headers,
-            timeout=self.timeout,
-        )
+        try:
+            resp = self.session.request(
+                method.upper(),
+                url,
+                data=body_str if body_str else None,
+                headers=headers,
+                timeout=self.timeout,
+            )
+        except requests.exceptions.RequestException:
+            # 网络层失败（断连/超时等）：GET 立即换连接重试一次。
+            # POST/PUT/DELETE 不重试——订单类请求重试可能造成重复提交。
+            if method.upper() != "GET":
+                raise
+            self.session.close()
+            self.session = requests.Session()
+            self.session.trust_env = self._use_proxy
+            resp = self.session.request(
+                "GET", url, headers=headers, timeout=self.timeout,
+            )
         return self._handle_response(resp)
 
     @staticmethod

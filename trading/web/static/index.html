@@ -568,6 +568,7 @@ const EVENT_TYPE_TEXT = {
   health: '健康监测', grid_recenter: '网格重建', signal_change: '信号翻转',
   rebalance: '再平衡', regime_change: '行情切换',
   circuit_breaker: '⛔ 熔断', circuit_resume: '✅ 熔断恢复',
+  api_outage: '🔌 API中断', api_recovered: '🔌 API恢复',
 };
 const SIGNAL_TEXT = { 1: '偏多·停卖', 0: '中性', '-1': '偏空·停买' };
 const SIGNAL_CLS = { 1: 'up', 0: '', '-1': 'down' };
@@ -597,6 +598,7 @@ function render(s) {
   let cbHtml = '';
   if (cb.global) cbHtml = '<span class="err">⛔ 大盘熔断中：全系统停止交易，等待 BTC 企稳</span>';
   else if (cb.pairs && cb.pairs.length) cbHtml = `<span class="err">⛔ 熔断中: ${cb.pairs.join(', ')}</span>`;
+  if (s.api_outage) cbHtml += ' <span class="err">🔌 API 持续中断中，自动重试…</span>';
   $('stErr').innerHTML = cbHtml || (s.last_error ? `<span class="err">⚠ 异常: ${s.last_error}</span>` : '');
 
   /* 累积历史 */
