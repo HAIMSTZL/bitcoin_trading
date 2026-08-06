@@ -1,4 +1,8 @@
-"""Web 面板：FastAPI + WebSocket 实时推送交易状态。"""
+"""Web 面板：FastAPI + WebSocket 实时推送交易状态。
+
+多策略架构：app.state.engines = {策略名: Engine}，
+所有接口通过 ?s=策略名 或请求体 strategy 字段路由。
+"""
 
 from __future__ import annotations
 
@@ -11,11 +15,18 @@ from fastapi.responses import FileResponse, JSONResponse
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-app = FastAPI(title="Gate 现货网格交易系统")
+app = FastAPI(title="MSTZL 现货网格交易系统")
 
 
-def _engine():
-    return app.state.engine
+def _engines() -> dict:
+    return app.state.engines
+
+
+def _pick(name: str | None):
+    engines = _engines()
+    if name and name in engines:
+        return engines[name]
+    return engines.get(app.state.default) or next(iter(engines.values()))
 
 
 @app.get("/")
@@ -23,9 +34,18 @@ async def index() -> FileResponse:
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
+@app.get("/api/strategies")
+async def api_strategies() -> JSONResponse:
+    return JSONResponse({
+        "default": app.state.default,
+        "list": [{"name": n, "label": e.profile.label}
+                 for n, e in _engines().items()],
+    })
+
+
 @app.get("/api/state")
-async def api_state() -> JSONResponse:
-    return JSONResponse(_engine().state())
+async def api_state(s: str | None = None) -> JSONResponse:
+    return JSONResponse(_pick(s).state())
 
 
 @app.post("/api/control")
@@ -35,7 +55,7 @@ async def api_control(req: dict) -> JSONResponse:
     stop 只停止交易引擎，Web 服务保持运行，之后仍可通过 start 重新启动；
     彻底退出进程请在终端 Ctrl+C。
     """
-    engine = _engine()
+    engine = _pick((req or {}).get("strategy"))
     action = (req or {}).get("action")
     try:
         if action in ("start", "resume"):
@@ -60,10 +80,18 @@ async def ws(websocket: WebSocket) -> None:
     await websocket.accept()
     try:
         while True:
-            state = _engine().state()
-            # 前端增量更新用：WS 推送不含完整历史，减小流量
-            state.pop("equity_history", None)
-            await websocket.send_text(json.dumps(state))
+            data = {}
+            for name, engine in _engines().items():
+                state = engine.state()
+                # WS 推送不含完整权益历史，减小流量
+                state.pop("equity_history", None)
+                data[name] = state
+            await websocket.send_text(json.dumps({
+                "default": app.state.default,
+                "list": [{"name": n, "label": e.profile.label}
+                         for n, e in _engines().items()],
+                "data": data,
+            }))
             await asyncio.sleep(2)
     except (WebSocketDisconnect, RuntimeError):
         pass

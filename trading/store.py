@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import time
+from typing import Optional
 
 from . import config
 
@@ -55,8 +56,24 @@ class Store:
                     message TEXT NOT NULL,
                     detail  TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE TABLE IF NOT EXISTS meta (
+                    k TEXT PRIMARY KEY,
+                    v TEXT NOT NULL
+                );
                 """
             )
+
+    def get_meta(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        return row["v"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO meta(k, v) VALUES (?,?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
 
     # ------------------------------------------------------------------
     # 事件日志（挂单/成交/控制/异常，供复盘）
@@ -98,6 +115,10 @@ class Store:
         with self._lock:
             rows = self._conn.execute("SELECT pair, data FROM bot_state").fetchall()
         return {r["pair"]: json.loads(r["data"]) for r in rows}
+
+    def delete_bot_state(self, pair: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM bot_state WHERE pair=?", (pair,))
 
     def clear_bot_states(self) -> None:
         with self._lock, self._conn:

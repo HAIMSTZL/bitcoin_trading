@@ -117,6 +117,33 @@ class SpotAPI:
         """查询交易手续费率。"""
         return self._c.get("/spot/fee", {"currency_pair": currency_pair})
 
+    def create_order(
+        self,
+        currency_pair: str,
+        side: str,
+        amount: str,
+        order_type: str = "market",
+        time_in_force: str = "ioc",
+        price: Optional[str] = None,
+    ) -> Any:
+        """下单（写操作，谨慎调用）。
+
+        :param side: buy/sell
+        :param amount: 市价买单为 USDT 金额，卖单为基础币数量；限价单为基础币数量
+        :param order_type: market/limit
+        """
+        body = {
+            "currency_pair": currency_pair,
+            "side": side,
+            "type": order_type,
+            "amount": amount,
+            "time_in_force": time_in_force,
+            "account": "spot",  # 显式现货账户，避免统一账户默认路由歧义
+        }
+        if price is not None:
+            body["price"] = price
+        return self._c.request("POST", "/spot/orders", body=body)
+
     def list_price_orders(self, status: str = "open", limit: int = 100) -> Any:
         """查询现货止盈止损（计划委托）订单。status: open/finished。"""
         return self._c.get(

@@ -188,6 +188,18 @@
     box-shadow: 4px 4px 0 rgba(20,22,26,.25);
   }
   .statusbar .err { color: var(--red); font-weight: 700; }
+
+  /* ===== 策略选项卡 ===== */
+  .strat-tabs { display: flex; gap: 8px; margin-bottom: 10px; }
+  .strat-tab {
+    border: 2px solid var(--ink); background: var(--panel); padding: 5px 18px;
+    font-family: inherit; font-size: 12px; font-weight: 700; letter-spacing: 2px;
+    cursor: pointer; box-shadow: 3px 3px 0 rgba(20,22,26,.25);
+  }
+  .strat-tab.active { background: var(--ink); color: #f2efe6; }
+  .strat-tab .pnl { font-weight: 400; font-size: 11px; margin-left: 6px; }
+  .strat-tab .pnl.up { color: var(--green); } .strat-tab.active .pnl.up { color: #3fb950; }
+  .strat-tab .pnl.down { color: var(--red); } .strat-tab.active .pnl.down { color: #ff8a80; }
 </style>
 </head>
 <body>
@@ -206,6 +218,9 @@
   <span class="clock mono-num" id="clock">--:--:-- UTC</span>
   <span class="live-tag">● LIVE</span>
 </div>
+
+<!-- ===== 策略选项卡 ===== -->
+<div class="strat-tabs" id="stratTabs"></div>
 
 <!-- ===== 滚动行情条 ===== -->
 <div class="ticker-wrap"><div class="ticker" id="ticker"><span class="lbl">LIVE FEED</span>&nbsp;&nbsp;连接中…</div></div>
@@ -300,14 +315,19 @@
 const $ = id => document.getElementById(id);
 const fmt = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? '-' :
   Number(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtPrice = v => v >= 100 ? fmt(v, 1) : fmt(v, 6);
 const signCls = v => v > 0 ? 'up' : (v < 0 ? 'down' : '');
 const HIST_MAX = 400;
 
-/* 客户端累积的历史数据 */
-const priceHist = { BTC_USDT: [], DOGE_USDT: [], ETH_USDT: [] };
+/* 客户端累积的历史数据（按 策略:币对 隔离，支持多策略切换） */
+let currentStrategy = null;
+const stratLabels = {};
+const stateCache = {};    // 策略 -> 最新状态
+const eqHists = {};       // 策略 -> 权益历史
+const priceHist = {};     // "策略:币对" -> 价格历史
 const priceFirst = {};
-let eqHist = [];          // {ts, equity, realized}
 let lastState = null;
 
 /* ================= 微型图（手绘 canvas） ================= */
@@ -569,14 +589,39 @@ const EVENT_TYPE_TEXT = {
   rebalance: '再平衡', regime_change: '行情切换',
   circuit_breaker: '⛔ 熔断', circuit_resume: '✅ 熔断恢复',
   api_outage: '🔌 API中断', api_recovered: '🔌 API恢复',
+  screen_start: '🔍 开始筛选', screen_none: '🔍 无合格候选', screen_error: '🔍 筛选失败',
+  slot_replace: '🔄 槽位替换',
 };
 const SIGNAL_TEXT = { 1: '偏多·停卖', 0: '中性', '-1': '偏空·停买' };
 const SIGNAL_CLS = { 1: 'up', 0: '', '-1': 'down' };
 const REGIME_TEXT = { ranging: '震荡市', trend_up: '趋势↑·停卖', trend_down: '趋势↓·停买' };
 const REGIME_CLS = { ranging: '', trend_up: 'up', trend_down: 'down' };
 
+/* 数据累积（每个策略独立），WS 每次推送对所有策略调用 */
+function ingest(s) {
+  const strat = s.strategy || 'default';
+  const t = s.last_tick || Date.now() / 1000;
+  for (const [pair, d] of Object.entries(s.pairs)) {
+    const key = strat + ':' + pair;
+    if (!(key in priceFirst)) priceFirst[key] = d.price;
+    const h = priceHist[key] || (priceHist[key] = []);
+    if (d.price && (!h.length || h[h.length - 1].v !== d.price)) {
+      h.push({ t, v: d.price });
+      if (h.length > HIST_MAX) h.shift();
+    }
+  }
+  const eqHist = eqHists[strat] || (eqHists[strat] = []);
+  const lastEq = eqHist[eqHist.length - 1];
+  if (!lastEq || t - lastEq.ts > 25) {
+    eqHist.push({ ts: t, equity: s.total_equity, realized: s.total_realized_profit });
+    if (eqHist.length > HIST_MAX) eqHist.shift();
+  }
+}
+
 function render(s) {
   lastState = s;
+  const strat = s.strategy || 'default';
+  const eqHist = eqHists[strat] || [];
   const rs = s.run_status || 'running';
   /* 顶栏 */
   $('chipMode').textContent = s.mode === 'live' ? '实盘 LIVE' : '模拟盘 PAPER';
@@ -599,27 +644,11 @@ function render(s) {
   if (cb.global) cbHtml = '<span class="err">⛔ 大盘熔断中：全系统停止交易，等待 BTC 企稳</span>';
   else if (cb.pairs && cb.pairs.length) cbHtml = `<span class="err">⛔ 熔断中: ${cb.pairs.join(', ')}</span>`;
   if (s.api_outage) cbHtml += ' <span class="err">🔌 API 持续中断中，自动重试…</span>';
-  $('stErr').innerHTML = cbHtml || (s.last_error ? `<span class="err">⚠ 异常: ${s.last_error}</span>` : '');
-
-  /* 累积历史 */
-  const t = s.last_tick || Date.now() / 1000;
-  for (const [pair, d] of Object.entries(s.pairs)) {
-    if (!(pair in priceFirst)) priceFirst[pair] = d.price;
-    const h = priceHist[pair];
-    if (d.price && (!h.length || h[h.length - 1].v !== d.price)) {
-      h.push({ t, v: d.price });
-      if (h.length > HIST_MAX) h.shift();
-    }
-  }
-  const lastEq = eqHist[eqHist.length - 1];
-  if (!lastEq || t - lastEq.ts > 25) {
-    eqHist.push({ ts: t, equity: s.total_equity, realized: s.total_realized_profit });
-    if (eqHist.length > HIST_MAX) eqHist.shift();
-  }
+  $('stErr').innerHTML = cbHtml || (s.last_error ? `<span class="err">⚠ 异常: ${esc(s.last_error)}</span>` : '');
 
   /* 行情条 */
   const tick = Object.values(s.pairs).map(d => {
-    const chg = (d.price - priceFirst[d.pair]) / priceFirst[d.pair] * 100;
+    const chg = (d.price - priceFirst[strat + ':' + d.pair]) / priceFirst[strat + ':' + d.pair] * 100;
     return `${d.pair.replace('_', '/')} <b class="mono-num">${fmtPrice(d.price)}</b> <span class="${signCls(chg)}">${chg >= 0 ? '▲' : '▼'}${fmt(Math.abs(chg), 2)}%</span>`;
   }).join('&nbsp;&nbsp;·&nbsp;&nbsp;');
   $('ticker').innerHTML = `<span class="lbl">LIVE FEED</span>&nbsp;&nbsp;${tick}` +
@@ -644,7 +673,7 @@ function render(s) {
 
   /* 价格监控 */
   $('priceRows').innerHTML = Object.values(s.pairs).map(d => {
-    const chg = (d.price - priceFirst[d.pair]) / priceFirst[d.pair] * 100;
+    const chg = (d.price - priceFirst[strat + ':' + d.pair]) / priceFirst[strat + ':' + d.pair] * 100;
     return `<div class="price-row">
       <span class="sym">${d.pair.replace('_', '/')}</span>
       <span class="val mono-num">${fmtPrice(d.price)}</span>
@@ -653,7 +682,7 @@ function render(s) {
   }).join('');
   Object.values(s.pairs).forEach(d => {
     const c = $('spark-' + d.pair);
-    if (c) drawSpark(c, priceHist[d.pair].map(p => p.v), '#2557d6', true);
+    if (c) drawSpark(c, (priceHist[strat + ':' + d.pair] || []).map(p => p.v), '#2557d6', true);
   });
 
   /* 持仓与挂单 */
@@ -719,7 +748,7 @@ function render(s) {
   $('events').innerHTML = (s.recent_events || []).map(e =>
     `<tr><td class="mono-num">${new Date(e.ts * 1000).toLocaleTimeString()}</td>
      <td class="lv-${e.level}">${e.level}</td>
-     <td>${EVENT_TYPE_TEXT[e.type] || e.type}</td><td>${e.message}</td></tr>`
+     <td>${EVENT_TYPE_TEXT[e.type] || e.type}</td><td>${esc(e.message)}</td></tr>`
   ).join('') || '<tr><td colspan="4" style="text-align:center;color:#6b6f76">暂无日志</td></tr>';
 }
 
@@ -729,11 +758,46 @@ async function control(action) {
   try {
     const r = await fetch('/api/control', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, strategy: currentStrategy }),
     });
     const d = await r.json();
     if (!d.ok) alert('操作失败: ' + (d.error || r.status));
   } catch (e) { alert('操作失败: ' + e); }
+}
+
+/* ================= 策略选项卡 ================= */
+function renderTabs(list) {
+  const el = $('stratTabs');
+  el.innerHTML = '';
+  list.forEach(item => {
+    stratLabels[item.name] = item.label;
+    const st = stateCache[item.name];
+    const pnl = st ? st.total_pnl : 0;
+    const btn = document.createElement('button');
+    btn.className = 'strat-tab' + (item.name === currentStrategy ? ' active' : '');
+    btn.innerHTML = item.label +
+      (st ? `<span class="pnl ${signCls(pnl)}">${pnl >= 0 ? '+' : ''}${fmt(pnl, 3)}U</span>` : '');
+    btn.onclick = () => switchStrategy(item.name);
+    el.appendChild(btn);
+  });
+}
+
+function switchStrategy(name) {
+  currentStrategy = name;
+  // 切到的策略若还没有权益历史，拉一次全量
+  if (!eqHists[name] || !eqHists[name].length) {
+    fetch('/api/state?s=' + name).then(r => r.json()).then(s => {
+      eqHists[name] = (s.equity_history || []).map(p => ({ ts: p.ts, equity: p.equity, realized: p.realized }));
+      if (stateCache[name]) render(stateCache[name]);
+    });
+  }
+  renderTabsFromCache();
+  if (stateCache[name]) render(stateCache[name]);
+}
+
+function renderTabsFromCache() {
+  const list = Object.keys(stratLabels).map(n => ({ name: n, label: stratLabels[n] }));
+  renderTabs(list);
 }
 
 /* ================= 时钟 ================= */
@@ -749,14 +813,32 @@ setInterval(() => {
 buildTree();
 window.addEventListener('resize', drawWires);
 
-fetch('/api/state').then(r => r.json()).then(s => {
-  eqHist = (s.equity_history || []).map(p => ({ ts: p.ts, equity: p.equity, realized: p.realized }));
+// 先取策略列表与默认策略全量状态，再开 WS
+fetch('/api/strategies').then(r => r.json()).then(meta => {
+  currentStrategy = meta.default;
+  meta.list.forEach(i => stratLabels[i.name] = i.label);
+  renderTabs(meta.list);
+  return fetch('/api/state?s=' + meta.default);
+}).then(r => r.json()).then(s => {
+  const name = s.strategy || 'default';
+  eqHists[name] = (s.equity_history || []).map(p => ({ ts: p.ts, equity: p.equity, realized: p.realized }));
+  stateCache[name] = s;
   render(s);
 }).catch(e => { $('stErr').innerHTML = '<span class="err">初始加载失败: ' + e + '</span>'; });
 
 function connect() {
   const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-  ws.onmessage = ev => render(JSON.parse(ev.data));
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (!msg.data) { render(msg); return; }  // 兼容旧格式
+    Object.entries(msg.data).forEach(([name, st]) => {
+      stateCache[name] = st;
+      ingest(st);
+    });
+    renderTabs(msg.list);
+    const cur = stateCache[currentStrategy];
+    if (cur) render(cur);
+  };
   ws.onclose = () => setTimeout(connect, 3000);
 }
 connect();

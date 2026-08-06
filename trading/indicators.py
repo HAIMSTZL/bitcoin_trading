@@ -137,8 +137,10 @@ class IndicatorEngine:
         self.last_update: Optional[float] = None
         self.last_error: Optional[str] = None
 
-    def update(self, pairs: tuple[str, ...]) -> None:
-        for pair in pairs:
+    def update(self, pairs) -> None:
+        for i, pair in enumerate(pairs):
+            if i > 0:
+                time.sleep(0.15)  # 请求节奏控制，避免瞬时打满限流
             try:
                 self.data[pair] = self._compute(pair)
             except Exception as e:
@@ -148,8 +150,10 @@ class IndicatorEngine:
 
     def _compute(self, pair: str) -> dict:
         candles = self._spot.list_candlesticks(pair, self.interval, self.kline_limit)
-        # [ts, 成交额, 收, 高, 低, 开, 量, 完结标记] —— 按时间升序
-        rows = sorted(candles, key=lambda r: int(r[0]))
+        # [ts, 成交额, 收, 高, 低, 开, 量, 完结标记] —— 按时间升序；
+        # 只使用已收盘的 K 线（未完结 K 线会让指标每个刷新周期抖动）
+        rows = [r for r in sorted(candles, key=lambda r: int(r[0]))
+                if len(r) < 8 or r[7] == "true"]
         closes = [float(r[2]) for r in rows]
         highs = [float(r[3]) for r in rows]
         lows = [float(r[4]) for r in rows]

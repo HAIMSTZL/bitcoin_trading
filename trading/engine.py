@@ -20,29 +20,54 @@ from typing import Any, Optional
 from gate_api import GateClient, SpotAPI
 
 from . import config
+from . import screener
 from .grid import GridBot, PaperAccount
 from .indicators import IndicatorEngine, atr_percent
 from .store import Store
 
 log = logging.getLogger("trading.engine")
 
+# 多策略引擎共享的行情缓存：同一批 tick 喂给所有引擎，
+# 既保证 A/B 对照看到同一时间戳的价格，也减少重复请求。
+_TICKER_CACHE: dict = {"ts": 0.0, "data": {}}
+_TICKER_TTL = 2.0
+
+
+def _fetch_tickers_cached(spot: SpotAPI, pairs) -> dict[str, float]:
+    now = time.time()
+    cache = _TICKER_CACHE
+    if now - cache["ts"] < _TICKER_TTL and all(p in cache["data"] for p in pairs):
+        return {p: cache["data"][p] for p in pairs}
+    data = {}
+    for pair in pairs:
+        tickers = spot.list_tickers(pair)
+        if tickers:
+            data[pair] = float(tickers[0]["last"])
+    cache["data"].update(data)
+    cache["ts"] = time.time()
+    return data
+
 
 class LiveExecutor:
     """实盘执行器：把网格成交信号转换为真实市价单。
 
     安全约束：
-    - 只允许 config.PAIRS 白名单内的现货交易对；
+    - 只允许白名单内的现货交易对（引擎运行时币对，补位替换后自动更新）；
     - 单笔 quote 金额不超过 config.MAX_ORDER_QUOTE；
     - 下单金额按交易对规则精度取整，低于最小限额则跳过。
     """
 
-    def __init__(self, spot: SpotAPI):
+    def __init__(self, spot: SpotAPI, pairs: list[str]):
         self._spot = spot
-        self._rules = {p: spot.get_currency_pair(p) for p in config.PAIRS}
+        self._rules = {p: spot.get_currency_pair(p) for p in pairs}
+
+    def allow_pair(self, pair: str) -> None:
+        """补位新币对加入白名单。"""
+        self._rules[pair] = self._spot.get_currency_pair(pair)
 
     def execute(self, fill: dict) -> None:
         pair = fill["pair"]
-        if pair not in config.PAIRS:
+        if pair not in self._rules:
             raise RuntimeError(f"拒绝交易非白名单币对: {pair}")
         rules = self._rules[pair]
         if rules.get("trade_status") != "tradable":
@@ -56,37 +81,42 @@ class LiveExecutor:
                 log.warning("买单金额 %.4f 低于最小限额 %.4f，跳过", quote, min_quote)
                 return
             # 市价买单 amount 以计价币（USDT）为单位
-            body = {
-                "currency_pair": pair, "side": "buy", "type": "market",
-                "amount": f"{quote:.2f}", "time_in_force": "ioc",
-            }
+            side, amount = "buy", f"{quote:.2f}"
         else:
-            amount = fill["amount"]
+            amount_f = fill["amount"]
             min_base = float(rules.get("min_base_amount") or 0)
-            if amount < min_base:
-                log.warning("卖单数量 %.8f 低于最小限额 %.8f，跳过", amount, min_base)
+            if amount_f < min_base:
+                log.warning("卖单数量 %.8f 低于最小限额 %.8f，跳过", amount_f, min_base)
                 return
             prec = int(rules.get("amount_precision") or 8)
-            body = {
-                "currency_pair": pair, "side": "sell", "type": "market",
-                "amount": f"{amount:.{prec}f}", "time_in_force": "ioc",
-            }
+            side, amount = "sell", f"{amount_f:.{prec}f}"
 
-        log.info("实盘下单: %s", body)
-        self._spot._c.request("POST", "/spot/orders", body=body)  # noqa: SLF001
+        log.info("实盘下单: %s %s %s", pair, side, amount)
+        self._spot.create_order(pair, side, amount, order_type="market",
+                                time_in_force="ioc")
 
 
 class Engine:
-    def __init__(self) -> None:
+    def __init__(self, profile=None) -> None:
         if config.TRADING_MODE == "live" and config.LIVE_CONFIRM != "YES_I_ACCEPT_RISK":
             raise RuntimeError(
                 "实盘模式需要双重确认：TRADING_MODE=live 且 "
                 "LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK"
             )
+        # 策略档案：不传则用 config 的默认完整配置（筛选轮换版）
+        if profile is None:
+            from .profiles import PROFILES
+            profile = PROFILES["rotation"]
+        self.profile = profile
         self.mode = config.TRADING_MODE
         self.client = GateClient(timeout=20.0)  # 引擎用更长超时，容忍网络抖动
         self.spot = SpotAPI(self.client)
-        self.store = Store()
+        # 模拟/实盘数据库严格隔离，报表不混模式
+        db_path = profile.db_path
+        if config.TRADING_MODE == "live":
+            import os as _os
+            db_path = _os.path.join(config.DATA_DIR, f"live_{profile.name}.db")
+        self.store = Store(db_path)
         self.account = PaperAccount()
         self.bots: dict[str, GridBot] = {}
         self.prices: dict[str, float] = {}
@@ -99,6 +129,7 @@ class Engine:
         self._stopped = False
         self._thread: Optional[threading.Thread] = None
         self._snapshot_counter = 0
+        self._last_snapshot = 0.0  # 权益快照按时间驱动（每30秒），而非 tick 计数
         self._last_health = 0.0  # 首次 tick 即报一条健康状态，之后按间隔
         self.indicators = IndicatorEngine(
             self.spot, interval=config.INDICATOR_KLINE,
@@ -106,13 +137,16 @@ class Engine:
         )
         self._last_indicator = 0.0
         self._last_signals: dict[str, int] = {}  # 各币对上一次【已确认】信号
-        self._signal_buf: dict[str, list[int]] = {p: [] for p in config.PAIRS}  # 确认缓冲
+        self._signal_buf: dict[str, list[int]] = {}  # 确认缓冲（按需初始化）
         self._last_flip: dict[str, float] = {}  # 各币对上次信号翻转时间（冷却用）
         self._regimes: dict[str, str] = {}  # 各币对行情状态 ranging/trend_up/trend_down
         self._last_rebalance = time.time()  # 启动后过完整周期才首次再平衡
         self._init_atr: dict[str, float] = {}  # 建仓时的 ATR%（自适应区间兜底）
+        # 运行时交易序列（槽位制）：初始为 PAIRS，补位替换时更新
+        self.pairs: list[str] = list(profile.pairs)
+        self._last_screen = 0.0  # 上次空仓筛选时刻
         # 熔断状态
-        self._price_hist: dict[str, list[tuple[float, float]]] = {p: [] for p in config.PAIRS}
+        self._price_hist: dict[str, list[tuple[float, float]]] = {}
         self._cb_pairs: dict[str, float] = {}   # 被熔断的币对 -> 熔断时刻
         self._cb_low: dict[str, list[float]] = {}  # 币对 -> [最低价, 最近创新低时间]
         self._cb_global = False  # 大盘熔断（BTC 触发，全系统停止撮合）
@@ -122,19 +156,30 @@ class Engine:
 
         self._init_bots()
         if self.mode == "live":
-            self.executor = LiveExecutor(self.spot)
+            self.executor = LiveExecutor(self.spot, self.pairs)
+        # 组合总盈亏基准：首次建仓时固定并持久化，网格重建/再平衡不重置（P2 修复）
+        ie = self.store.get_meta("initial_equity")
+        if ie is None:
+            self._initial_total = sum(
+                self.account.get(p)["quote"]
+                + self.account.get(p)["base"] * self.prices.get(p, 0.0)
+                for p in self.pairs
+            )
+            self.store.set_meta("initial_equity", str(self._initial_total))
+        else:
+            self._initial_total = float(ie)
         # 默认待命：服务启动后只初始化环境，等用户在 Web 面板点击"开始"才正式交易
         self._paused.set()
 
     # ------------------------------------------------------------------
     def _fetch_prices(self) -> dict[str, float]:
-        """按币对分别查询 ticker（响应小、抗超时；全市场单次拉取响应数 MB 易超时）。"""
-        prices: dict[str, float] = {}
-        for pair in config.PAIRS:
-            tickers = self.spot.list_tickers(pair)
-            if tickers:
-                prices[pair] = float(tickers[0]["last"])
-        return prices
+        """按币对分别查询 ticker（响应小、抗超时；全市场单次拉取响应数 MB 易超时）。
+
+        BTC 作为大盘熔断基准，无论是否在交易序列中都必须拉取（P1 修复：
+        补位换币可能把 BTC 换出序列，不能让大盘熔断失明）。
+        多引擎共享 _TICKER_CACHE，同一批行情供所有策略。
+        """
+        return _fetch_tickers_cached(self.spot, set(self.pairs) | {"BTC_USDT"})
 
     def _real_spot_balances(self) -> dict[str, float]:
         return {a["currency"]: float(a["available"]) for a in self.spot.list_accounts()}
@@ -142,53 +187,52 @@ class Engine:
     def _init_bots(self) -> None:
         """初始化环境。
 
-        - 模拟盘：优先恢复上次落盘的虚拟账户与网格状态，继续交易；
-          无存档时按 PAPER_MIRROR_REAL 镜像真实现货账户（或虚拟预算）新建。
+        - 模拟盘：优先恢复上次落盘的虚拟账户与网格状态（含补位后的币对序列），
+          继续交易；无存档时按 PAPER_MIRROR_REAL 镜像真实现货账户（或虚拟预算）新建。
         - 实盘：每次启动重新读取真实账户状态建仓。
         """
-        self.prices = self._fetch_prices()
-
         if self.mode == "paper":
             saved = self.store.load_bot_states()
-            if all(p in saved for p in config.PAIRS):
+            if saved:
+                self.pairs = list(saved.keys())  # 运行时币对 = 存档币对
+                self.prices = self._fetch_prices()
                 sig_now = self._config_sig()
-                if all(saved[p].get("config_sig") == sig_now[p] for p in config.PAIRS):
-                    for pair in config.PAIRS:
-                        bot = GridBot.from_dict(saved[pair], self.account)
+                for pair in self.pairs:
+                    d = saved[pair]
+                    if d.get("config_sig") == sig_now.get(pair):
+                        bot = GridBot.from_dict(d, self.account)
                         bot.on_order = self._on_order_placed
                         bot.fee_rate = config.PAPER_FEE_RATE
                         self.bots[pair] = bot
-                    log.info(
-                        "已恢复上次模拟盘状态: %s",
-                        {p: {"quote": round(self.account.get(p)["quote"], 4),
-                             "base": round(self.account.get(p)["base"], 4),
-                             "orders": len(self.bots[p].orders)} for p in config.PAIRS},
-                    )
-                    self._event("INFO", "lifecycle", "恢复上次模拟盘存档继续交易",
-                                detail={p: {"quote": self.account.get(p)["quote"],
-                                            "base": self.account.get(p)["base"],
-                                            "orders": len(self.bots[p].orders)}
-                                        for p in config.PAIRS})
-                    return
-                # 网格参数已变更：保留存档中的余额与利润，按新参数重建网格
-                log.info("网格参数已变更，按新参数重建（保留余额与利润）")
-                self._event("INFO", "lifecycle", "网格参数变更，按新参数重建网格（保留余额与利润）")
-                for pair in config.PAIRS:
-                    d = saved[pair]
-                    self.account.init_pair(pair, d["quote"], d["base"])
-                    bot = self._build_bot(pair, self.prices[pair],
-                                          d["quote"], d["base"])
-                    bot.realized_profit = d.get("realized_profit", 0.0)
-                    bot.trade_count = d.get("trade_count", 0)
-                    bot.blocked_count = d.get("blocked_count", 0)
-                    bot.total_fees = d.get("total_fees", 0.0)
-                    self.bots[pair] = bot
+                    else:
+                        # 参数已变更：保留余额与利润，按新参数重建
+                        self.account.init_pair(pair, d["quote"], d["base"])
+                        bot = self._build_bot(pair, self.prices[pair],
+                                              d["quote"], d["base"])
+                        bot.realized_profit = d.get("realized_profit", 0.0)
+                        bot.trade_count = d.get("trade_count", 0)
+                        bot.blocked_count = d.get("blocked_count", 0)
+                        bot.total_fees = d.get("total_fees", 0.0)
+                        bot.ever_held = d.get("ever_held", False)
+                        self.bots[pair] = bot
+                log.info(
+                    "已恢复上次模拟盘状态: %s",
+                    {p: {"quote": round(self.account.get(p)["quote"], 4),
+                         "base": round(self.account.get(p)["base"], 4),
+                         "orders": len(self.bots[p].orders)} for p in self.pairs},
+                )
+                self._event("INFO", "lifecycle", "恢复上次模拟盘存档继续交易",
+                            detail={p: {"quote": self.account.get(p)["quote"],
+                                        "base": self.account.get(p)["base"],
+                                        "orders": len(self.bots[p].orders)}
+                                    for p in self.pairs})
                 return
             log.info("未找到模拟盘存档，按初始仓位新建网格")
             self._event("INFO", "lifecycle", "未找到模拟盘存档，按初始仓位新建网格")
 
+        self.prices = self._fetch_prices()
         budgets = self._initial_budgets()
-        for pair in config.PAIRS:
+        for pair in self.pairs:
             price = self.prices.get(pair)
             if not price:
                 raise RuntimeError(f"未获取到 {pair} 行情")
@@ -196,20 +240,21 @@ class Engine:
             self.account.init_pair(pair, quote_budget, base_budget)
             self.bots[pair] = self._build_bot(pair, price, quote_budget, base_budget)
 
-    @staticmethod
-    def _config_sig() -> dict[str, str]:
+    def _config_sig(self) -> dict[str, str]:
         """各币对网格参数签名，用于检测配置变更后重建。"""
-        mode = "dyn" if config.DYNAMIC_ALLOCATION else "eq"
-        return {
-            p: (f'{config.GRID_CONFIG[p]["range_pct"]}:{config.GRID_CONFIG[p]["grids"]}'
-                f':{config.TOTAL_QUOTE_BUDGET}:{mode}')
-            for p in config.PAIRS
-        }
+        mode = "dyn" if self.profile.dynamic_allocation else "eq"
+        geo = "g" if config.GRID_GEOMETRIC else "a"
+        sig = {}
+        for p in self.pairs:
+            cfg = config.GRID_CONFIG.get(p, config.GRID_DEFAULT)
+            sig[p] = (f'{cfg["range_pct"]}:{cfg["grids"]}'
+                      f':{config.TOTAL_QUOTE_BUDGET}:{mode}:{geo}')
+        return sig
 
     def _desired_range_pct(self, pair: str) -> float:
         """当前应有的网格区间幅度：ADAPTIVE_RANGE 开启时随 ATR% 自适应。"""
-        cfg = config.GRID_CONFIG[pair]
-        if not config.ADAPTIVE_RANGE:
+        cfg = config.GRID_CONFIG.get(pair, config.GRID_DEFAULT)
+        if not self.profile.adaptive_range:
             return cfg["range_pct"]
         atr = self.indicators.get(pair).get("atr_pct", 0.0) or self._init_atr.get(pair, 0.0)
         if atr <= 0:
@@ -220,12 +265,20 @@ class Engine:
     def _build_bot(
         self, pair: str, price: float, quote_budget: float, base_budget: float
     ) -> GridBot:
-        cfg = config.GRID_CONFIG[pair]
+        cfg = config.GRID_CONFIG.get(pair, config.GRID_DEFAULT)
         range_pct = self._desired_range_pct(pair)
+        grids = cfg["grids"]
+        # 费用守卫：单格间距必须显著大于双边手续费，否则加宽区间
+        min_range = 2.2 * config.PAPER_FEE_RATE * (grids - 1) / 2
+        if range_pct < min_range:
+            log.warning("%s 区间 ±%.2f%% 过窄（单格利润率低于费用门槛），加宽至 ±%.2f%%",
+                        pair, range_pct * 100, min_range * 100)
+            range_pct = min_range
         lower = price * (1 - range_pct)
         upper = price * (1 + range_pct)
-        bot = GridBot(pair, lower, upper, cfg["grids"], quote_budget, base_budget,
-                      fee_rate=config.PAPER_FEE_RATE)
+        bot = GridBot(pair, lower, upper, grids, quote_budget, base_budget,
+                      fee_rate=config.PAPER_FEE_RATE,
+                      geometric=config.GRID_GEOMETRIC)
         bot.on_order = self._on_order_placed  # 先挂监听器，捕获初始挂单
         bot.start(price, self.account)
         log.info(
@@ -263,28 +316,29 @@ class Engine:
         )
 
     def _initial_budgets(self) -> dict[str, tuple[float, float]]:
-        if config.PAPER_MIRROR_REAL:
+        # 实盘必须读真实账户（P0 修复）：PAPER_MIRROR_REAL 只约束模拟盘。
+        if self.mode == "live" or config.PAPER_MIRROR_REAL:
             # 模拟盘仓位完全镜像真实现货账户：各基础币按实际可用余额，
             # USDT 按各币对持仓价值比例分配（无持仓则均分）。
             real = self._real_spot_balances()
             usdt = real.get("USDT", 0.0)
-            bases = {p: real.get(p.split("_")[0], 0.0) for p in config.PAIRS}
+            bases = {p: real.get(p.split("_")[0], 0.0) for p in self.pairs}
             total_base_val = sum(
-                bases[p] * self.prices.get(p, 0.0) for p in config.PAIRS
+                bases[p] * self.prices.get(p, 0.0) for p in self.pairs
             )
             budgets = {}
-            for pair in config.PAIRS:
+            for pair in self.pairs:
                 if total_base_val > 0:
                     weight = bases[pair] * self.prices[pair] / total_base_val
                 else:
-                    weight = 1.0 / len(config.PAIRS)
+                    weight = 1.0 / len(self.pairs)
                 budgets[pair] = (usdt * weight, bases[pair])
             log.info("镜像真实账户: USDT=%s, 持仓=%s", usdt, bases)
             return budgets
         return {
             p: (self._allocate_quotes().get(p, 0.0),
-                float(config.GRID_CONFIG[p]["base_budget"]))
-            for p in config.PAIRS
+                float(config.GRID_CONFIG.get(p, config.GRID_DEFAULT)["base_budget"]))
+            for p in self.pairs
         }
 
     def _allocate_quotes(self) -> dict[str, float]:
@@ -293,35 +347,21 @@ class Engine:
         网格策略赚的是波动的钱：ATR% 越高权重越大；
         ALLOC_MIN_W/MAX_W 限制单币对占比。失败时回退均分。
         """
-        n = len(config.PAIRS)
+        n = len(self.pairs)
         total = config.TOTAL_QUOTE_BUDGET
-        if not config.DYNAMIC_ALLOCATION:
-            return {p: total / n for p in config.PAIRS}
+        if not self.profile.dynamic_allocation:
+            return {p: total / n for p in self.pairs}
         try:
             vols = {}
-            for pair in config.PAIRS:
+            for pair in self.pairs:
                 candles = self.spot.list_candlesticks(pair, config.INDICATOR_KLINE, 40)
                 vols[pair] = atr_percent(candles)
             if sum(vols.values()) <= 0:
                 raise ValueError("ATR 全为 0")
             self._init_atr = vols  # 供自适应区间在建仓时使用
-            weights = {p: v / sum(vols.values()) for p, v in vols.items()}
-            # 夹紧到 [MIN, MAX] 后按剩余比例再分配（两轮收敛即可）
-            for _ in range(2):
-                fixed = {p: w for p, w in weights.items()
-                         if w <= config.ALLOC_MIN_W or w >= config.ALLOC_MAX_W}
-                free = [p for p in weights if p not in fixed]
-                fixed_total = sum(
-                    min(max(w, config.ALLOC_MIN_W), config.ALLOC_MAX_W)
-                    for w in fixed.values()
-                )
-                free_total = sum(weights[p] for p in free)
-                weights = {
-                    p: (min(max(weights[p], config.ALLOC_MIN_W), config.ALLOC_MAX_W)
-                        if p in fixed else weights[p] / free_total * (1 - fixed_total))
-                    for p in weights
-                }
-            alloc = {p: total * weights[p] for p in config.PAIRS}
+            weights = self._apply_weight_caps(
+                {p: v / sum(vols.values()) for p, v in vols.items()})
+            alloc = {p: total * weights[p] for p in self.pairs}
             log.info("动态预算分配: %s (ATR%%: %s)",
                      {p: round(a, 2) for p, a in alloc.items()},
                      {p: round(v, 3) for p, v in vols.items()})
@@ -336,7 +376,28 @@ class Engine:
             return alloc
         except Exception as e:
             log.warning("动态分配失败(%s)，回退均分", e)
-            return {p: total / n for p in config.PAIRS}
+            return {p: total / n for p in self.pairs}
+
+    @staticmethod
+    def _apply_weight_caps(weights: dict[str, float]) -> dict[str, float]:
+        """权重夹紧到 [ALLOC_MIN_W, ALLOC_MAX_W] 后按剩余比例再分配。"""
+        for _ in range(2):
+            fixed = {p: w for p, w in weights.items()
+                     if w <= config.ALLOC_MIN_W or w >= config.ALLOC_MAX_W}
+            free = [p for p in weights if p not in fixed]
+            if not free:
+                break
+            fixed_total = sum(
+                min(max(w, config.ALLOC_MIN_W), config.ALLOC_MAX_W)
+                for w in fixed.values()
+            )
+            free_total = sum(weights[p] for p in free)
+            weights = {
+                p: (min(max(weights[p], config.ALLOC_MIN_W), config.ALLOC_MAX_W)
+                    if p in fixed else weights[p] / free_total * (1 - fixed_total))
+                for p in weights
+            }
+        return weights
 
     def _save_bot_states(self) -> None:
         if self.mode != "paper":
@@ -378,9 +439,10 @@ class Engine:
             fill["amount"], fill["quote"], fill["profit"],
         )
         side = "买入" if fill["side"] == "buy" else "卖出"
+        sweep = "（清仓扫尾）" if fill.get("sweep") else ""
         self._event(
             "INFO", "order_filled",
-            f"{side}成交 @ {fill['price']:.8g} 数量 {fill['amount']:.8g} "
+            f"{side}成交{sweep} @ {fill['price']:.8g} 数量 {fill['amount']:.8g} "
             f"金额 {fill['quote']:.4f} USDT 利润 {fill['profit']:.4f}",
             pair=fill["pair"], detail=fill,
         )
@@ -408,17 +470,96 @@ class Engine:
                 self._recenter(pair, price)
             self.bots[pair].step(price, self.account, record=self._record_fill)
         self.last_tick = time.time()
+        self._maybe_fill_slot()  # 空仓槽位补位筛选
         self._save_bot_states()  # 模拟盘每个 tick 落盘，保证重启后可续跑
 
-        # 每 10 个 tick 落一次权益快照，控制数据库体积
-        self._snapshot_counter += 1
-        if self._snapshot_counter % 10 == 0:
+        # 权益快照按时间驱动（30 秒一条），tick 卡顿也不丢曲线
+        if self.last_tick - self._last_snapshot >= 30:
+            self._last_snapshot = self.last_tick
             state = self.state()
             self.store.record_equity(
                 state["total_equity"], state["total_realized_profit"],
                 {p: s["equity"] for p, s in state["pairs"].items()},
             )
         self._maybe_health_check()
+
+    # ------------------------------------------------------------------
+    # 槽位补位：空仓币对触发全市场筛选，最优合格候选替换
+    # ------------------------------------------------------------------
+    def _flat_pairs(self) -> list[str]:
+        """绝对空仓的槽位：曾持仓、当前 base=0 且无卖单。"""
+        flat = []
+        for pair, bot in self.bots.items():
+            bal = self.account.get(pair)
+            has_sell = any(o["side"] == "sell" for o in bot.orders.values())
+            if bot.ever_held and bal["base"] <= 0 and not has_sell:
+                flat.append(pair)
+        return flat
+
+    def _maybe_fill_slot(self) -> None:
+        if self.mode != "paper":
+            return  # 实盘换币需人工确认，暂不自动补位
+        if not self.profile.slot_rotation:
+            return  # 该策略未启用换币（对照组）
+        flat = self._flat_pairs()
+        if not flat:
+            return
+        now = time.time()
+        if now - self._last_screen < config.SCREEN_INTERVAL:
+            return
+        self._last_screen = now
+        log.info("槽位空仓: %s，启动全市场筛选", flat)
+        self._event("INFO", "screen_start", f"槽位空仓: {','.join(flat)}，开始全市场筛选")
+        try:
+            best = screener.screen(self.spot, exclude=set(self.pairs))
+        except Exception as e:
+            log.exception("筛选失败")
+            self._event("ERROR", "screen_error", f"筛选失败: {type(e).__name__}: {e}")
+            # 异常失败（网络等）10 分钟后重试，不等完整周期
+            self._last_screen = now - config.SCREEN_INTERVAL + 600
+            return
+        if not best:
+            log.info("未筛到合格候选，维持现状（%s 继续）", flat[0])
+            self._event("INFO", "screen_none",
+                        f"未筛到合格候选（及格线 {config.SCREEN_MIN_SCORE} 分），维持 {flat[0]} 继续交易")
+            return
+        self._replace_pair(flat[0], best)
+
+    def _replace_pair(self, old: str, cand: dict) -> None:
+        """用候选币对替换空仓槽位：转移 USDT 子弹，建仓新网格。"""
+        new = cand["pair"]
+        tickers = self.spot.list_tickers(new)
+        if not tickers:
+            log.error("补位失败：无法获取 %s 行情", new)
+            return
+        price = float(tickers[0]["last"])
+
+        bal = self.account.get(old)
+        freed_quote = bal["quote"]
+        log.warning("槽位替换: %s -> %s (得分 %.1f, 转移 %.2fU)",
+                    old, new, cand["score"], freed_quote)
+
+        # 旧槽位退役：撤掉虚拟挂单，余额清零
+        del self.bots[old]
+        self.account.balances.pop(old, None)
+        self.store.delete_bot_state(old)
+        self.pairs[self.pairs.index(old)] = new
+
+        # 新币对建仓
+        self.account.init_pair(new, freed_quote, 0.0)
+        self.prices[new] = price
+        self.bots[new] = self._build_bot(new, price, freed_quote, 0.0)
+        if self.executor:
+            self.executor.allow_pair(new)
+
+        self._event(
+            "WARNING", "slot_replace",
+            f"槽位替换: {old} → {new} · 得分 {cand['score']} · "
+            f"ATR {cand['atr_pct']}% · 点差 {cand['spread_pct']}% · "
+            f"深度 {cand['depth_usdt']:.0f}U · 转移子弹 {freed_quote:.2f}U",
+            pair=new, detail=cand,
+        )
+        self._save_bot_states()
 
     # ------------------------------------------------------------------
     # 熔断机制
@@ -439,7 +580,7 @@ class Engine:
         window = config.CB_WINDOW_MIN * 60
         stable = config.CB_RESUME_STABLE_MIN * 60
         for pair, price in self.prices.items():
-            hist = self._price_hist[pair]
+            hist = self._price_hist.setdefault(pair, [])
             hist.append((now, price))
             cutoff = now - max(window, stable) - 60  # 保留到恢复判定所需长度
             while hist and hist[0][0] < cutoff:
@@ -493,10 +634,10 @@ class Engine:
         if now - self._last_indicator < config.INDICATOR_INTERVAL:
             return
         self._last_indicator = now
-        self.indicators.update(config.PAIRS)
-        for pair in config.PAIRS:
+        self.indicators.update(self.pairs)
+        for pair in self.pairs:
             ind = self.indicators.get(pair)
-            raw_sig = ind["signal"] if config.USE_SIGNAL_FILTER else 0
+            raw_sig = ind["signal"] if self.profile.use_signal_filter else 0
             sig = self._confirm_signal(pair, raw_sig)  # 迟滞确认后的信号
             bot = self.bots.get(pair)
             if bot:
@@ -539,7 +680,7 @@ class Engine:
         if raw == cur:
             self._signal_buf[pair] = []
             return cur
-        buf = self._signal_buf[pair]
+        buf = self._signal_buf.setdefault(pair, [])
         buf.append(raw)
         del buf[:-config.SIGNAL_CONFIRM_COUNT]
         if len(buf) < config.SIGNAL_CONFIRM_COUNT or len(set(buf)) != 1:
@@ -592,24 +733,25 @@ class Engine:
             return
         self._last_rebalance = now
 
-        # 权重 = ATR% × (1 + 倾斜系数×信号)
+        # 权重 = ATR% × (1 + 倾斜系数×【已确认】信号)，再经过占比夹紧
         raw = {}
-        for pair in config.PAIRS:
+        for pair in self.pairs:
             ind = self.indicators.get(pair)
             atr = max(ind.get("atr_pct", 0.0), 1e-6)
-            sig = ind.get("signal", 0) if config.USE_SIGNAL_FILTER else 0
+            sig = self._last_signals.get(pair, 0) if self.profile.use_signal_filter else 0
             raw[pair] = atr * (1 + config.REBALANCE_SIGNAL_TILT * sig)
         total_raw = sum(raw.values())
-        weights = {p: v / total_raw for p, v in raw.items()}
+        weights = self._apply_weight_caps(
+            {p: v / total_raw for p, v in raw.items()})
 
         # 子弹池 = 各币对 USDT 总额（买单是虚拟挂单，重切子弹零成本）
-        pool = sum(self.account.get(p)["quote"] for p in config.PAIRS)
+        pool = sum(self.account.get(p)["quote"] for p in self.pairs)
         if pool < 3:
             return  # 没有值得挪动的子弹
 
         deltas = {
             p: pool * weights[p] - self.account.get(p)["quote"]
-            for p in config.PAIRS
+            for p in self.pairs
         }
         if max(abs(d) for d in deltas.values()) < max(1.0, pool * config.REBALANCE_MIN_DRIFT):
             log.info("再平衡检查: 偏离不足阈值，不动作 (池子 %.2fU, 权重 %s)",
@@ -618,7 +760,7 @@ class Engine:
 
         # 执行：重设各币对 USDT = 池子×权重（总额守恒），并按新预算重建买单侧
         # 同步记账资金调拨（capital_adjust），避免盈亏基准被调拨污染
-        for pair in config.PAIRS:
+        for pair in self.pairs:
             old_q = self.account.get(pair)["quote"]
             new_q = pool * weights[pair]
             self.account.get(pair)["quote"] = new_q
@@ -792,14 +934,16 @@ class Engine:
     # ------------------------------------------------------------------
     def state(self) -> dict[str, Any]:
         pairs = {}
-        for pair, bot in self.bots.items():
+        for pair, bot in list(self.bots.items()):  # 快照遍历，防引擎线程并发修改
             s = bot.state(self.prices.get(pair, bot.start_price or 0), self.account)
             s["frozen"] = self._cb_global or pair in self._cb_pairs
             pairs[pair] = s
         total_equity = sum(s["equity"] for s in pairs.values())
-        total_initial = sum(s["initial_equity"] for s in pairs.values())
+        total_initial = self._initial_total  # 固定基准（建仓时落库），不受重建/调拨影响
         return {
             "mode": self.mode,
+            "strategy": self.profile.name,
+            "strategy_label": self.profile.label,
             "run_status": self.run_status,
             "circuit_breaker": {
                 "global": self._cb_global,
@@ -816,8 +960,8 @@ class Engine:
             "total_realized_profit": sum(s["realized_profit"] for s in pairs.values()),
             "total_fees": sum(s["total_fees"] for s in pairs.values()),
             "pairs": pairs,
-            "indicators": {p: self.indicators.get(p) for p in config.PAIRS},
-            "signal_filter": config.USE_SIGNAL_FILTER,
+            "indicators": {p: self.indicators.get(p) for p in self.pairs},
+            "signal_filter": self.profile.use_signal_filter,
             "recent_trades": self.store.recent_trades(50),
             "recent_events": self.store.recent_events(50),
             "equity_history": self.store.equity_history(300),

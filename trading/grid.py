@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from . import config as _cfg
+
 
 class PaperAccount:
     """按交易对隔离的虚拟账户。quote=USDT, base=基础币。"""
@@ -35,24 +37,35 @@ class GridBot:
         quote_budget: float,
         base_budget: float,
         fee_rate: float = 0.0,
+        geometric: bool = True,
     ):
         if not (lower > 0 and upper > lower and grids >= 3):
             raise ValueError("非法网格参数")
         self.pair = pair
         self.lower = lower
         self.upper = upper
-        step = (upper - lower) / (grids - 1)
-        self.levels = [lower + step * i for i in range(grids)]
+        if geometric:
+            # 等百分比间距：每格收益率一致，跨价位更均匀
+            ratio = (upper / lower) ** (1 / (grids - 1))
+            self.levels = [lower * ratio ** i for i in range(grids)]
+        else:
+            step = (upper - lower) / (grids - 1)
+            self.levels = [lower + step * i for i in range(grids)]
         self.quote_budget = quote_budget
         self.base_budget = base_budget
         self.fee_rate = fee_rate  # 单边手续费率（模拟盘按成交金额扣）
 
-        # idx -> 挂单 {side, price, quote_amount, base_amount, buy_price}
+        # idx -> 挂单 {side, price, quote_amount, base_amount}
+        # 利润按持仓移动平均成本 avg_cost 结转（含买入手续费）
         self.orders: dict[int, dict[str, Any]] = {}
         self.start_price: Optional[float] = None
         self.realized_profit = 0.0  # USDT 口径（已扣手续费）
         self.trade_count = 0
         self.total_fees = 0.0  # 累计手续费（USDT）
+        self.ever_held = False  # 是否曾持有仓位（补位筛选的触发前提）
+        # 持仓移动平均成本（USDT/个，含买费）：买入时加权更新，清空时归 None。
+        # 重建/补挂不改写它——成本属于存货，不属于订单。
+        self.avg_cost: Optional[float] = None
         self.regime = "ranging"  # 行情状态（引擎写入）：ranging/trend_up/trend_down
         # 再平衡资金调拨累计（USDT 净流入）：盈亏基准随之调整，
         # 避免资金调拨被误计为交易亏损（引擎在再平衡时写入）
@@ -91,13 +104,14 @@ class GridBot:
                     "base_amount": quote_per / self.levels[i],
                 }
                 self._notify_order(self.orders[i])
+        if base_per > 0:
+            self.avg_cost = price  # 初始库存以启动市值为成本基准
         for i in sell_levels:
             if base_per > 0 and not self._blocked("sell"):
                 self.orders[i] = {
                     "side": "sell",
                     "price": self.levels[i],
                     "base_amount": base_per,
-                    "buy_price": price,  # 初始库存以启动价为成本基准
                 }
                 self._notify_order(self.orders[i])
 
@@ -132,8 +146,14 @@ class GridBot:
                 fee = order["quote_amount"] * self.fee_rate
                 base_got = (order["quote_amount"] - fee) / order["price"]
                 self.total_fees += fee
+                old_base = bal["base"]
+                new_base = old_base + base_got
+                # 移动平均成本：含买入手续费（quote_amount 是实际付出的全部 USDT）
+                self.avg_cost = (
+                    old_base * (self.avg_cost or order["price"]) + order["quote_amount"]
+                ) / new_base
                 bal["quote"] -= order["quote_amount"]
-                bal["base"] += base_got
+                bal["base"] = new_base
                 del self.orders[idx]
                 fill = {
                     "pair": self.pair, "side": "buy", "price": order["price"],
@@ -141,8 +161,9 @@ class GridBot:
                     "profit": 0.0, "fee": fee,
                 }
                 self._on_fill(fill, record, fills)
+                self.ever_held = True
                 # 上一档挂出卖单
-                self._place_sell(idx + 1, base_got, order["price"])
+                self._place_sell(idx + 1, base_got)
             elif order["side"] == "sell" and price >= order["price"]:
                 if bal["base"] + 1e-12 < order["base_amount"]:
                     continue
@@ -152,9 +173,12 @@ class GridBot:
                 self.total_fees += fee
                 bal["base"] -= order["base_amount"]
                 bal["quote"] += proceeds
-                profit = proceeds - order["base_amount"] * order.get("buy_price", order["price"])
+                cost_per = self.avg_cost if self.avg_cost is not None else order["price"]
+                profit = proceeds - order["base_amount"] * cost_per
                 self.realized_profit += profit
                 del self.orders[idx]
+                if bal["base"] <= 0:
+                    self.avg_cost = None
                 fill = {
                     "pair": self.pair, "side": "sell", "price": order["price"],
                     "amount": order["base_amount"], "quote": proceeds,
@@ -163,18 +187,50 @@ class GridBot:
                 self._on_fill(fill, record, fills)
                 # 下一档挂回买单
                 self._place_buy(idx - 1, order["base_amount"])
+                # 清仓收尾：剩余持仓已不足一个网格批且没有卖单了 → 直接全卖扫尾归 0
+                self._maybe_sweep(price, bal, record, fills)
 
         return fills
 
     # ------------------------------------------------------------------
-    def _place_sell(self, idx: int, base_amount: float, buy_price: float) -> None:
+    def _maybe_sweep(
+        self,
+        price: float,
+        bal: dict,
+        record: Optional[Callable[[dict], None]],
+        fills: list[dict],
+    ) -> None:
+        remaining = bal["base"]
+        if remaining <= 0 or remaining * price >= _cfg.SWEEP_DUST_USDT:
+            return
+        if any(o["side"] == "sell" for o in self.orders.values()):
+            return  # 还有卖单在路上，让正常网格处理
+        # 以略低于现价挂扫尾卖单，下一个 tick 必成交；利润按平均成本结转
+        sweep_price = price * 0.999
+        fee = remaining * sweep_price * self.fee_rate
+        proceeds = remaining * sweep_price - fee
+        cost_per = self.avg_cost if self.avg_cost is not None else price
+        profit = proceeds - remaining * cost_per
+        self.total_fees += fee
+        self.realized_profit += profit
+        bal["base"] -= remaining
+        bal["quote"] += proceeds
+        self.avg_cost = None
+        fill = {
+            "pair": self.pair, "side": "sell", "price": sweep_price,
+            "amount": remaining, "quote": proceeds, "profit": profit,
+            "fee": fee, "sweep": True,
+        }
+        self._on_fill(fill, record, fills)
+
+    # ------------------------------------------------------------------
+    def _place_sell(self, idx: int, base_amount: float) -> None:
         if idx >= len(self.levels) or idx in self.orders or self._blocked("sell"):
             return  # 超出区间顶部：卖出后不再补单（利润落袋）；偏多信号：不卖飞
         self.orders[idx] = {
             "side": "sell",
             "price": self.levels[idx],
             "base_amount": base_amount,
-            "buy_price": buy_price,
         }
         self._notify_order(self.orders[idx])
 
@@ -198,7 +254,7 @@ class GridBot:
                 self._notify_order(self.orders[i])
 
     def rebuild_sells(self, price: float, account: PaperAccount) -> None:
-        """重建卖单侧（买单保持不变）：信号解封后补挂。成本基准以现价计。"""
+        """重建卖单侧（买单保持不变）：信号解封后补挂。不改写持仓成本（avg_cost）。"""
         self.orders = {i: o for i, o in self.orders.items() if o["side"] != "sell"}
         bal = account.get(self.pair)
         sell_levels = [i for i, p in enumerate(self.levels)
@@ -212,7 +268,6 @@ class GridBot:
                     "side": "sell",
                     "price": self.levels[i],
                     "base_amount": base_per,
-                    "buy_price": price,  # 以现价为成本基准
                 }
                 self._notify_order(self.orders[i])
 
@@ -257,6 +312,8 @@ class GridBot:
             "blocked_count": self.blocked_count,
             "total_fees": self.total_fees,
             "capital_adjust": self.capital_adjust,
+            "ever_held": self.ever_held,
+            "avg_cost": self.avg_cost,
             "orders": {str(i): o for i, o in self.orders.items()},
             "quote": bal["quote"],
             "base": bal["base"],
@@ -274,6 +331,11 @@ class GridBot:
         bot.blocked_count = data.get("blocked_count", 0)
         bot.total_fees = data.get("total_fees", 0.0)
         bot.capital_adjust = data.get("capital_adjust", 0.0)
+        bot.ever_held = data.get("ever_held", False)
+        bot.avg_cost = data.get("avg_cost")
+        # 旧存档无 avg_cost：有持仓时以启动价兜底
+        if bot.avg_cost is None and data.get("base", 0) > 0:
+            bot.avg_cost = data.get("start_price")
         bot.orders = {int(i): o for i, o in data["orders"].items()}
         account.init_pair(data["pair"], data["quote"], data["base"])
         return bot

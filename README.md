@@ -1,9 +1,10 @@
-# Gate API v4 Python 封装（只读）
+# Gate API v4 Python 封装
 
 对 [Gate API v4](https://www.gate.com/docs/developers/apiv4/en/) 的轻量 Python 封装，
-覆盖现货、永续合约、交割合约、钱包、子账户/托管、交易机器人模块的**只读查询接口**。
+覆盖现货、永续合约、交割合约、钱包、子账户/托管、交易机器人模块。
 
-- 不封装下单/撤单/划转/提现等写操作；
+- 以只读查询接口为主；唯一的写接口是 `SpotAPI.create_order()`（供交易系统实盘
+  模式使用，受币对白名单与单笔限额约束）；
 - 密钥只从环境变量 `MY_GATE_KEY` / `MY_GATE_SECRET` 读取，代码中无明文密钥；
 - 仅依赖 `requests`。
 
@@ -42,9 +43,24 @@ requirements.txt
 .venv/bin/python run.py
 # 打开 http://127.0.0.1:8000 查看实时面板
 
+# 只跑部分策略（默认全部启用）
+STRATEGIES=classic,rotation .venv/bin/python run.py
+
 # 实盘（双重确认，真实下单；live 执行路径未经真实下单测试，启用前请小额验证）
 TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 ```
+
+**多策略 A/B 对照**（`feature/coin-rotation` 分支起）：多个策略实例同时运行，
+面板顶部选项卡切换查看；各策略独立虚拟账户、独立数据库
+（`trading/data/trading_<name>.db`，rotation 沿用主库 `trading.db`）：
+
+| 策略 | 说明 |
+|------|------|
+| `classic` 经典网格 | 对照组：固定三币对、固定区间、均分、不换币 |
+| `rotation` 筛选轮换 | 完整版：信号过滤 + 自适应区间 + 动态分配 + 空仓换币 |
+| `aggressive` 激进轮动 | 无信号过滤双向硬跑 + 自适应区间 + 换币 |
+
+策略定义在 `trading/profiles.py`，可自行增删改。
 
 - 网格参数（区间幅度、层数）在 `trading/config.py` 中调整；
 - **启动流程**：服务启动后只做环境初始化，处于待命状态，需在面板点击 **开始** 才正式交易：

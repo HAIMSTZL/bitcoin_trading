@@ -53,20 +53,34 @@ def main() -> None:
     log = logging.getLogger("run")
 
     from trading.engine import Engine  # 延迟导入，先配好日志
+    from trading.profiles import enabled_profiles
 
-    try:
-        engine = Engine()
-    except Exception:
-        # 初始化阶段的异常（网络、密钥、行情获取失败等）也必须留下记录
-        log.critical("引擎初始化失败", exc_info=True)
-        raise
+    config.validate()
+    profiles = enabled_profiles()
+    # 实盘防呆：live 模式必须显式指定且仅运行一个策略
+    if config.TRADING_MODE == "live" and len(profiles) != 1:
+        raise RuntimeError(
+            "实盘模式只允许运行一个策略，请用 STRATEGIES=策略名 显式指定"
+        )
+    engines = {}
+    for name, profile in profiles.items():
+        try:
+            engine = Engine(profile)
+        except Exception:
+            # 初始化阶段的异常（网络、密钥、行情获取失败等）也必须留下记录
+            log.critical("引擎初始化失败: %s", name, exc_info=True)
+            raise
+        engine.start_background()
+        engines[name] = engine
+        log.info("策略已启动: %s (%s)", name, profile.label)
 
-    engine.start_background()
-    app.state.engine = engine
+    app.state.engines = engines
+    app.state.default = next(iter(engines))
     try:
         uvicorn.run(app, host=config.WEB_HOST, port=config.WEB_PORT, log_level="info")
     finally:
-        engine.stop()
+        for engine in engines.values():
+            engine.stop()
 
 
 if __name__ == "__main__":

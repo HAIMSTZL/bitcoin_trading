@@ -59,6 +59,8 @@ GRID_CONFIG: dict = {
     "DOGE_USDT": {"range_pct": 0.04, "grids": 21, "base_budget": 0.0},
     "ETH_USDT": {"range_pct": 0.035, "grids": 21, "base_budget": 0.0},
 }
+# 补位新币对的默认网格参数（未在 GRID_CONFIG 中配置的币对使用）
+GRID_DEFAULT: dict = {"range_pct": 0.04, "grids": 21, "base_budget": 0.0}
 
 # ---- 指标信号过滤 ----
 # true: MACD/KDJ/盘口/主动成交 汇总为趋势信号，偏空时暂停挂买单（不接飞刀）、
@@ -84,13 +86,36 @@ PAPER_FEE_RATE = float(os.environ.get("PAPER_FEE_RATE", "0.001"))
 #       波动大自动加宽间距（每格利润厚、成交少而稳），波动小自动收窄。
 ADAPTIVE_RANGE = os.environ.get("ADAPTIVE_RANGE", "true").lower() == "true"
 ADAPTIVE_RANGE_MULT = float(os.environ.get("ADAPTIVE_RANGE_MULT", "10"))
-RANGE_PCT_MIN = float(os.environ.get("RANGE_PCT_MIN", "0.02"))
+# 注意：下限 3% = 21 档时间距约 0.3%，必须显著大于双边手续费（约 0.2%）才有净利润
+RANGE_PCT_MIN = float(os.environ.get("RANGE_PCT_MIN", "0.03"))
 RANGE_PCT_MAX = float(os.environ.get("RANGE_PCT_MAX", "0.15"))
 
 # ---- 趋势市识别 ----
 # 3 小时涨跌幅超过该值且确认信号同向 = 趋势市：
 # 趋势下跌→冻结买单（握 USDT 等待）；趋势上涨→冻结卖单（握住筹码）。
 TREND_MOVE_PCT = float(os.environ.get("TREND_MOVE_PCT", "4.0"))
+
+# ---- 币种筛选与补位（槽位制）----
+# 交易序列固定 3 个槽位，初始为 PAIRS。某槽位曾持仓且绝对空仓（base=0 且无卖单）
+# → 触发全市场筛选，最优合格候选补位；筛不到则维持原币对，每小时重筛。
+SCREEN_INTERVAL = float(os.environ.get("SCREEN_INTERVAL", "3600"))  # 空仓重筛周期（秒）
+SCREEN_TOP_N = int(os.environ.get("SCREEN_TOP_N", "20"))            # 粗筛后精筛数量
+SCREEN_MIN_SCORE = float(os.environ.get("SCREEN_MIN_SCORE", "60"))  # 合格分数线
+# 硬性排除（妖币/死币过滤）
+SCREEN_MIN_QUOTE_VOL = float(os.environ.get("SCREEN_MIN_QUOTE_VOL", "5000000"))  # 24h成交额(USDT)
+SCREEN_MAX_AMPLITUDE = float(os.environ.get("SCREEN_MAX_AMPLITUDE", "15"))       # 24h振幅%
+SCREEN_MAX_CHANGE = float(os.environ.get("SCREEN_MAX_CHANGE", "20"))             # 24h涨跌%
+SCREEN_MAX_SPREAD = float(os.environ.get("SCREEN_MAX_SPREAD", "0.05"))           # 盘口点差%
+SCREEN_MAX_ATR = float(os.environ.get("SCREEN_MAX_ATR", "3.0"))                  # ATR% 上限
+# 收尾：卖出后剩余持仓价值低于该值（USDT）时，直接全部扫尾卖出，让仓位归 0
+SWEEP_DUST_USDT = float(os.environ.get("SWEEP_DUST_USDT", "5"))
+# 几何网格：等百分比间距（跨价位更均匀，每格收益率一致），false 为等价差
+GRID_GEOMETRIC = os.environ.get("GRID_GEOMETRIC", "true").lower() == "true"
+# 锚定型资产（稳定币/金银代币）不参与补位筛选——波动被人为锚定，网格无利可图
+SCREEN_EXCLUDE = {
+    "USDC_USDT", "TUSD_USDT", "USD1_USDT", "FDUSD_USDT", "DAI_USDT",
+    "USDE_USDT", "USDY_USDT", "PYUSD_USDT", "XAUT_USDT", "PAXG_USDT",
+}
 
 # ---- 熔断机制（tick 级快速断路器）----
 # 单币对：现价相对 CB_WINDOW_MIN 分钟窗口内最高点回撤 ≥ CB_DROP_PCT% → 冻结该币对双侧挂单；
@@ -122,3 +147,17 @@ DB_PATH = os.path.join(DATA_DIR, "trading.db")
 # ---- Web 服务 ----
 WEB_HOST = os.environ.get("WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.environ.get("WEB_PORT", "8000"))
+
+
+def validate() -> None:
+    """启动时配置校验，非法配置直接 fail-fast。"""
+    assert 0 < TICK_INTERVAL <= 60, "TICK_INTERVAL 应在 (0, 60] 秒"
+    assert TOTAL_QUOTE_BUDGET > 0, "TOTAL_QUOTE_BUDGET 必须为正"
+    assert 0 < ALLOC_MIN_W < ALLOC_MAX_W <= 1, "ALLOC_MIN_W/MAX_W 区间非法"
+    assert PAPER_FEE_RATE >= 0, "PAPER_FEE_RATE 不能为负"
+    assert RANGE_PCT_MIN < RANGE_PCT_MAX, "RANGE_PCT_MIN 必须小于 MAX"
+    for p, c in GRID_CONFIG.items():
+        assert c["grids"] >= 3, f"{p} grids 至少 3"
+        assert 0 < c["range_pct"] < 0.5, f"{p} range_pct 应在 (0, 0.5)"
+    if TRADING_MODE not in ("paper", "live"):
+        raise ValueError(f"非法 TRADING_MODE: {TRADING_MODE}")
