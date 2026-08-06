@@ -113,8 +113,8 @@ def score_candidate(spot: SpotAPI, pair: str) -> Optional[dict]:
     }
 
 
-def screen(spot: SpotAPI, exclude: set[str]) -> Optional[dict]:
-    """执行完整筛选，返回最优合格候选；无合格候选返回 None。"""
+def screen_top(spot: SpotAPI, exclude: set[str], n: int = 1) -> list[dict]:
+    """执行完整筛选，返回按分数降序的合格候选（最多 n 个）；无合格返回空表。"""
     candidates = coarse_filter(spot, exclude)
     log.info("粗筛通过 %d 个候选: %s", len(candidates),
              [c["pair"] for c in candidates[:10]])
@@ -127,13 +127,16 @@ def screen(spot: SpotAPI, exclude: set[str]) -> Optional[dict]:
                 scored.append(s)
         except Exception as e:
             log.warning("精筛 %s 失败: %s", c["pair"], e)
-    if not scored:
-        return None
     scored.sort(key=lambda s: -s["score"])
     log.info("精筛打分: %s", [(s["pair"], s["score"]) for s in scored[:5]])
-    best = scored[0]
-    if best["score"] < config.SCREEN_MIN_SCORE:
+    qualified = [s for s in scored if s["score"] >= config.SCREEN_MIN_SCORE]
+    if scored and not qualified:
         log.info("最优候选 %s 得分 %.1f < 及格线 %.1f，宁缺毋滥",
-                 best["pair"], best["score"], config.SCREEN_MIN_SCORE)
-        return None
-    return best
+                 scored[0]["pair"], scored[0]["score"], config.SCREEN_MIN_SCORE)
+    return qualified[:n]
+
+
+def screen(spot: SpotAPI, exclude: set[str]) -> Optional[dict]:
+    """执行完整筛选，返回最优合格候选；无合格候选返回 None。"""
+    top = screen_top(spot, exclude, n=1)
+    return top[0] if top else None

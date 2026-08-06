@@ -59,6 +59,7 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 | `classic` 经典网格 | 对照组：固定三币对、固定区间、均分、不换币 |
 | `rotation` 筛选轮换 | 完整版：信号过滤 + 自适应区间 + 动态分配 + 空仓换币 |
 | `aggressive` 激进轮动 | 无信号过滤双向硬跑 + 自适应区间 + 换币 |
+| `hunter` 猎手精选 | 启动即全市场筛选 Top3 建仓，无信号过滤激进风格 |
 
 策略定义在 `trading/profiles.py`，可自行增删改。
 

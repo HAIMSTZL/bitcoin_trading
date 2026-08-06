@@ -230,6 +230,30 @@ class Engine:
             log.info("未找到模拟盘存档，按初始仓位新建网格")
             self._event("INFO", "lifecycle", "未找到模拟盘存档，按初始仓位新建网格")
 
+        # 猎手模式：启动即全市场筛选 Top-N 建仓（忽略默认币对）
+        if self.mode == "paper" and self.profile.auto_screen:
+            try:
+                cands = screener.screen_top(self.spot, exclude=set(), n=len(self.pairs))
+            except Exception as e:
+                log.exception("启动筛选失败，使用默认币对")
+                self._event("ERROR", "screen_error",
+                            f"启动筛选失败: {type(e).__name__}: {e}，使用默认币对")
+                cands = []
+            if cands:
+                self.pairs = [c["pair"] for c in cands]
+                log.warning("猎手建仓: 筛选结果 %s",
+                            [(c["pair"], c["score"]) for c in cands])
+                self._event(
+                    "WARNING", "slot_replace",
+                    "启动筛选建仓: " + ", ".join(
+                        f"{c['pair']}({c['score']}分)" for c in cands),
+                    detail={"candidates": cands},
+                )
+            else:
+                log.warning("启动筛选无合格候选，使用默认币对 %s", self.pairs)
+                self._event("INFO", "screen_none",
+                            "启动筛选无合格候选，使用默认币对建仓")
+
         self.prices = self._fetch_prices()
         budgets = self._initial_budgets()
         for pair in self.pairs:

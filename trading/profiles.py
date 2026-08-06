@@ -23,6 +23,7 @@ class Profile:
     adaptive_range: bool = True      # ATR 自适应区间
     dynamic_allocation: bool = True  # 波动率动态分配 + 定期再平衡
     slot_rotation: bool = True       # 空仓槽位筛选换币
+    auto_screen: bool = False        # 启动即全市场筛选 Top-N 建仓（忽略 pairs）
 
     @property
     def db_path(self) -> str:
@@ -53,6 +54,14 @@ PROFILES: dict[str, Profile] = {
         pairs=config.PAIRS,
         use_signal_filter=False, adaptive_range=True,
         dynamic_allocation=True, slot_rotation=True,
+    ),
+    # 猎手组：启动即全市场筛选 Top3 建仓，激进风格（无信号过滤）
+    "hunter": Profile(
+        name="hunter", label="猎手精选",
+        pairs=config.PAIRS,  # 仅作槽位数量与兜底，启动时会被筛选结果替换
+        use_signal_filter=False, adaptive_range=True,
+        dynamic_allocation=True, slot_rotation=True,
+        auto_screen=True,
     ),
 }
 
