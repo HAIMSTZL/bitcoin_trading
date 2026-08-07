@@ -95,6 +95,22 @@ def test_serialization_roundtrip():
     assert bot2.ever_held is True
 
 
+def test_stoploss_override_uses_injected_clock():
+    """回测的止损覆盖值使用历史时钟，不影响默认运行配置。"""
+    now = [0.0]
+    acc = PaperAccount()
+    acc.init_pair("T_USDT", 0.0, 1.0)
+    bot = GridBot(
+        "T_USDT", 95, 105, 11, 0.0, 1.0, geometric=False,
+        clock=lambda: now[0], stoploss_hours=1.0, stoploss_cooldown_min=0.0,
+    )
+    bot.start(100.0, acc)
+    bot.step(90.0, acc)  # 开始水下计时
+    now[0] = 3601.0
+    fills = bot.step(90.0, acc)
+    assert len(fills) == 1 and fills[0]["stoploss"] is True
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

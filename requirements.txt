@@ -1,4 +1,7 @@
 requests>=2.31
+numpy>=1.26
+scikit-learn>=1.5,<2
+xgboost>=3.4,<4
 fastapi
 uvicorn[standard]
 pytest

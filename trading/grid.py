@@ -39,6 +39,9 @@ class GridBot:
         base_budget: float,
         fee_rate: float = 0.0,
         geometric: bool = True,
+        clock: Callable[[], float] = time.time,
+        stoploss_hours: Optional[float] = None,
+        stoploss_cooldown_min: Optional[float] = None,
     ):
         if not (lower > 0 and upper > lower and grids >= 3):
             raise ValueError("非法网格参数")
@@ -55,6 +58,12 @@ class GridBot:
         self.quote_budget = quote_budget
         self.base_budget = base_budget
         self.fee_rate = fee_rate  # 单边手续费率（模拟盘按成交金额扣）
+        # 默认使用系统时间；回测可注入历史时间，复用止损/冷却的生产逻辑。
+        self._clock = clock
+        # None 表示继续动态读取全局运行配置；回测可传入固定值做消融，
+        # 不改变 Web 参数修改后已运行机器人的语义。
+        self._stoploss_hours = stoploss_hours
+        self._stoploss_cooldown_min = stoploss_cooldown_min
 
         # idx -> 挂单 {side, price, quote_amount, base_amount}
         # 利润按持仓移动平均成本 avg_cost 结转（含买入手续费）
@@ -125,7 +134,7 @@ class GridBot:
     # ------------------------------------------------------------------
     def _blocked(self, side: str) -> bool:
         """趋势信号拦截：偏空(-1)不接买单，偏多(+1)不卖；止损冷却期不接买单。"""
-        if side == "buy" and time.time() < self.no_buy_until:
+        if side == "buy" and self._clock() < self.no_buy_until:
             self.blocked_count += 1
             return True
         if side == "buy" and self.signal == -1:
@@ -141,18 +150,20 @@ class GridBot:
                         record: Optional[Callable[[dict], None]],
                         fills: list[dict]) -> None:
         """水下限时持有：超过 STUCK_STOPLOSS_HOURS 无高于成本的成交 → 市价止损。"""
+        now = self._clock()
         underwater = (bal["base"] > 0 and self.avg_cost is not None
                       and price < self.avg_cost)
         if not underwater:
             self.underwater_since = None
             return
         if self.underwater_since is None:
-            self.underwater_since = time.time()
+            self.underwater_since = now
             return
-        hours = _cfg.STUCK_STOPLOSS_HOURS
+        hours = (_cfg.STUCK_STOPLOSS_HOURS if self._stoploss_hours is None
+                 else self._stoploss_hours)
         if hours <= 0:
             return  # 关闭止损
-        if time.time() - self.underwater_since < hours * 3600:
+        if now - self.underwater_since < hours * 3600:
             return
         # 触发止损：全部持仓按现价卖出（亏损落账）
         amount = bal["base"]
@@ -165,7 +176,9 @@ class GridBot:
         bal["quote"] += proceeds
         self.avg_cost = None
         self.underwater_since = None
-        self.no_buy_until = time.time() + _cfg.STOPLOSS_COOLDOWN_MIN * 60
+        cooldown = (_cfg.STOPLOSS_COOLDOWN_MIN if self._stoploss_cooldown_min is None
+                    else self._stoploss_cooldown_min)
+        self.no_buy_until = now + cooldown * 60
         # 止损后卖单已无意义，撤掉；买单保留待补位/冷却后被替换或恢复
         self.orders = {i: o for i, o in self.orders.items() if o["side"] != "sell"}
         fill = {

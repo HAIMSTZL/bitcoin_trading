@@ -31,6 +31,25 @@ PAPER_MIRROR_REAL = os.environ.get("PAPER_MIRROR_REAL", "false").lower() == "tru
 # ---- 虚拟资金总预算与动态分配 ----
 # 当前设定（用户指定）：纯 233 USDT 起步、无基础币持仓。
 TOTAL_QUOTE_BUDGET = float(os.environ.get("TOTAL_QUOTE_BUDGET", "233"))
+# ---- 预测策略模拟盘（严格 paper-only）----
+# 静态币池防止根据近期收益事后选币；不受网格 PAIRS 三币白名单限制，
+# 但仅供独立 predictive 模拟引擎使用，绝不会进入现有实盘执行路径。
+PREDICTIVE_PAIRS: tuple[str, ...] = (
+    "BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT", "DOGE_USDT",
+    "BNB_USDT", "ADA_USDT", "AVAX_USDT", "LINK_USDT", "LTC_USDT",
+)
+PREDICTIVE_HISTORY_DAYS = int(os.environ.get("PREDICTIVE_HISTORY_DAYS", "150"))
+PREDICTIVE_KLINE_REFRESH_SEC = float(os.environ.get("PREDICTIVE_KLINE_REFRESH_SEC", "300"))
+# 已验证的研究候选：48h 预测、24h 调仓、120 天训练、每周重训、BTC 168h EMA 风控。
+PREDICTIVE_HORIZON_HOURS = int(os.environ.get("PREDICTIVE_HORIZON_HOURS", "48"))
+PREDICTIVE_TRAIN_DAYS = int(os.environ.get("PREDICTIVE_TRAIN_DAYS", "120"))
+PREDICTIVE_RETRAIN_HOURS = int(os.environ.get("PREDICTIVE_RETRAIN_HOURS", "168"))
+PREDICTIVE_REBALANCE_HOURS = int(os.environ.get("PREDICTIVE_REBALANCE_HOURS", "24"))
+PREDICTIVE_THRESHOLD = float(os.environ.get("PREDICTIVE_THRESHOLD", "0.003"))
+PREDICTIVE_MAX_POSITIONS = int(os.environ.get("PREDICTIVE_MAX_POSITIONS", "3"))
+PREDICTIVE_MARKET_EMA = int(os.environ.get("PREDICTIVE_MARKET_EMA", "168"))
+# 模拟盘采用比研究默认值更保守的 10 bps 单侧滑点，先用实际观察校准。
+PREDICTIVE_SLIPPAGE_BPS = float(os.environ.get("PREDICTIVE_SLIPPAGE_BPS", "10"))
 # true: 按各币对近期波动率（ATR%）动态分配总预算——网格赚波动的钱，
 #       波动越大分越多；ALLOC_MIN/MAX_W 限制单币对占比，防极端。
 # false: 三币对均分。
@@ -157,6 +176,10 @@ def validate() -> None:
     """启动时配置校验，非法配置直接 fail-fast。"""
     assert 0 < TICK_INTERVAL <= 60, "TICK_INTERVAL 应在 (0, 60] 秒"
     assert TOTAL_QUOTE_BUDGET > 0, "TOTAL_QUOTE_BUDGET 必须为正"
+    assert PREDICTIVE_HISTORY_DAYS >= PREDICTIVE_TRAIN_DAYS + 7, "预测策略历史窗口不足"
+    assert PREDICTIVE_HORIZON_HOURS > 0 and PREDICTIVE_REBALANCE_HOURS > 0, "预测策略周期必须为正"
+    assert 1 <= PREDICTIVE_MAX_POSITIONS <= len(PREDICTIVE_PAIRS), "预测策略持仓数非法"
+    assert PREDICTIVE_SLIPPAGE_BPS >= 0, "预测策略滑点不能为负"
     assert 0 < ALLOC_MIN_W < ALLOC_MAX_W <= 1, "ALLOC_MIN_W/MAX_W 区间非法"
     assert PAPER_FEE_RATE >= 0, "PAPER_FEE_RATE 不能为负"
     assert RANGE_PCT_MIN < RANGE_PCT_MAX, "RANGE_PCT_MIN 必须小于 MAX"

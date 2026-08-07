@@ -301,7 +301,7 @@
   </div>
 
   <div class="panel">
-    <div class="panel-head">网格扫描器 <span class="tag">GRID SCANNER</span></div>
+    <div class="panel-head">策略扫描器 <span class="tag">STRATEGY SCANNER</span></div>
     <div class="panel-body" id="scanRows"></div>
   </div>
 </div>
@@ -573,6 +573,21 @@ function spawnFillParticles(s) {
 }
 
 function updateTree(s) {
+  if (s.strategy_kind === 'predictive') {
+    const p = s.predictive || {};
+    const active = new Set(['tick', 'price', 'detect']);
+    if ((p.target || []).length) { active.add('buy'); active.add('rebuy'); active.add('pnl'); }
+    NODES.forEach(([id]) => {
+      const el = $('node-' + id);
+      if (el) el.classList.toggle('active', active.has(id));
+    });
+    const strip = $('actionStrip');
+    const target = (p.target || []).map(x => x.replace('_USDT', '')).join(' / ');
+    strip.textContent = target
+      ? `Ridge 预测轮动 · 目标 ${target} · ${p.horizon_hours || 48}h 预测 · 每 ${p.rebalance_hours || 24}h 决策`
+      : `Ridge 预测轮动 · 持有 USDT · 等待预测超过 ${fmt((p.threshold || 0) * 100, 2)}% 且 BTC 风控放行`;
+    return;
+  }
   spawnFillParticles(s);
   const now = Date.now() / 1000;
   const active = new Set(['tick', 'price', 'detect']);  // 常态链路
@@ -625,6 +640,9 @@ const EVENT_TYPE_TEXT = {
   api_outage: '🔌 API中断', api_recovered: '🔌 API恢复',
   screen_start: '🔍 开始筛选', screen_none: '🔍 无合格候选', screen_error: '🔍 筛选失败',
   slot_replace: '🔄 槽位替换',
+  predictive_history: '🧠 预测历史', predictive_train: '🧠 模型训练',
+  predictive_signal: '🧠 预测信号', predictive_rebalance: '🧠 预测调仓',
+  predictive_fill: '🧠 虚拟成交', predictive_score: '🧠 恢复评分',
 };
 const SIGNAL_TEXT = { 1: '偏多·停卖', 0: '中性', '-1': '偏空·停买' };
 const SIGNAL_CLS = { 1: 'up', 0: '', '-1': 'down' };
@@ -729,7 +747,19 @@ function render(s) {
       <td class="side-buy">${buys}</td><td class="side-sell">${sells}</td></tr>`;
   }).join('');
 
-  /* 网格扫描器（含指标信号） */
+  /* 网格扫描器 / 预测信号面板 */
+  if (s.strategy_kind === 'predictive') {
+    const p = s.predictive || {};
+    $('scanRows').innerHTML = Object.values(s.pairs).filter(d => d.pair !== 'USDT').map(d => {
+      const pred = d.predicted_return;
+      const selected = !!d.selected;
+      return `<div class="scan-row">
+        <div class="scan-head"><span>${d.pair.replace('_', '/')} <b class="${selected ? 'up' : ''}" style="font-size:10px">${selected ? '已入选' : '候选'}</b></span><span class="mono-num">${fmtPrice(d.price)}</span></div>
+        <div class="scan-mid"><span>预测 ${p.horizon_hours || 48}h 收益 <b class="mono-num ${signCls(pred || 0)}">${pred === null || pred === undefined ? '等待训练' : (pred >= 0 ? '+' : '') + fmt(pred * 100, 3) + '%'}</b></span></div>
+        <div class="scan-mid"><span>阈值 <b class="mono-num">${fmt((p.threshold || 0) * 100, 2)}%</b></span><span>状态 <b class="${selected ? 'up' : ''}">${selected ? '持有/调仓目标' : 'USDT 等待'}</b></span></div>
+      </div>`;
+    }).join('');
+  } else {
   $('scanRows').innerHTML = Object.values(s.pairs).map(d => {
     const buysBelow = d.orders.filter(o => o.side === 'buy' && o.price < d.price).map(o => o.price);
     const sellsAbove = d.orders.filter(o => o.side === 'sell' && o.price > d.price).map(o => o.price);
@@ -763,6 +793,7 @@ function render(s) {
       ${d.blocked_count ? `<div class="scan-mid"><span>信号拦截挂单 <b>${d.blocked_count}</b> 次</span></div>` : ''}
     </div>`;
   }).join('');
+  }
 
   /* 决策树 */
   updateTree(s);

@@ -19,6 +19,7 @@ class Profile:
     name: str
     label: str
     pairs: tuple[str, ...]
+    kind: str = "grid"             # grid | predictive；predictive 仅支持模拟盘
     use_signal_filter: bool = True   # 指标信号过滤
     adaptive_range: bool = True      # ATR 自适应区间
     dynamic_allocation: bool = True  # 波动率动态分配 + 定期再平衡
@@ -62,6 +63,13 @@ PROFILES: dict[str, Profile] = {
         use_signal_filter=False, adaptive_range=True,
         dynamic_allocation=True, slot_rotation=True,
         auto_screen=True,
+    ),
+    # 预测候选：不是网格，纯 USDT 起步、long/flat、多币种等权；由独立 paper 引擎执行。
+    "predictive": Profile(
+        name="predictive", label="预测轮动（研究）",
+        pairs=config.PREDICTIVE_PAIRS, kind="predictive",
+        use_signal_filter=False, adaptive_range=False,
+        dynamic_allocation=False, slot_rotation=False,
     ),
 }
 

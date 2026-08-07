@@ -53,6 +53,7 @@ def main() -> None:
     log = logging.getLogger("run")
 
     from trading.engine import Engine  # 延迟导入，先配好日志
+    from trading.predictive_engine import PredictivePaperEngine
     from trading.profiles import enabled_profiles
 
     config.validate()
@@ -67,7 +68,8 @@ def main() -> None:
     engines = {}
     for name, profile in profiles.items():
         try:
-            engine = Engine(profile)
+            engine = (PredictivePaperEngine(profile)
+                      if profile.kind == "predictive" else Engine(profile))
         except Exception:
             # 初始化阶段的异常（网络、密钥、行情获取失败等）也必须留下记录
             log.critical("引擎初始化失败: %s", name, exc_info=True)
