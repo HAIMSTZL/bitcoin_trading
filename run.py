@@ -56,6 +56,8 @@ def main() -> None:
     from trading.profiles import enabled_profiles
 
     config.validate()
+    from trading import settings
+    settings.load_overrides()  # 加载本地保存的参数覆盖
     profiles = enabled_profiles()
     # 实盘防呆：live 模式必须显式指定且仅运行一个策略
     if config.TRADING_MODE == "live" and len(profiles) != 1:

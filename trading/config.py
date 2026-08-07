@@ -109,6 +109,10 @@ SCREEN_MAX_SPREAD = float(os.environ.get("SCREEN_MAX_SPREAD", "0.05"))          
 SCREEN_MAX_ATR = float(os.environ.get("SCREEN_MAX_ATR", "3.0"))                  # ATR% 上限
 # 收尾：卖出后剩余持仓价值低于该值（USDT）时，直接全部扫尾卖出，让仓位归 0
 SWEEP_DUST_USDT = float(os.environ.get("SWEEP_DUST_USDT", "5"))
+# 止损：水下持仓（现价低于平均成本）持续该小时数仍无高于成本的成交 → 市价清仓止损；
+# 0 = 关闭（永不亏卖）。止损后 STOPLOSS_COOLDOWN_MIN 分钟内不接新买单。
+STUCK_STOPLOSS_HOURS = float(os.environ.get("STUCK_STOPLOSS_HOURS", "4"))
+STOPLOSS_COOLDOWN_MIN = float(os.environ.get("STOPLOSS_COOLDOWN_MIN", "60"))
 # 几何网格：等百分比间距（跨价位更均匀，每格收益率一致），false 为等价差
 GRID_GEOMETRIC = os.environ.get("GRID_GEOMETRIC", "true").lower() == "true"
 # 锚定型资产（稳定币/金银代币）不参与补位筛选——波动被人为锚定，网格无利可图

@@ -199,7 +199,18 @@ range_pct = clamp(ADAPTIVE_RANGE_MULT × ATR%, RANGE_PCT_MIN, RANGE_PCT_MAX)
 `PAPER_FEE_RATE`（默认 0.001 = 单边 0.1%）：买入按成交金额扣费（得币变少）、
 卖出扣费（得 U 变少），已实现利润为**扣费后净利**，面板显示"累计手续费"。
 
-### 5.3e 熔断机制（v1.4 新增，tick 级快速断路器）
+### 5.3e 不亏卖与限时止损（v2.2 新增）
+
+- **不亏卖**：卖单只挂在高于持仓平均成本（avg_cost，含买费）的档位；
+  低于成本的库存拿着等回本，重建网格不改写成本基准；
+- **限时止损**：水下持仓（现价 < 平均成本）持续 `STUCK_STOPLOSS_HOURS`
+  （默认 4 小时）仍无高于成本的成交 → **按现价市价清仓，亏损落账**，
+  记 `stoploss` 成交（日志标注"水下超时止损"）；
+- 止损后 `STOPLOSS_COOLDOWN_MIN`（默认 60）分钟内该币对不接新买单；
+  止损后槽位空仓 → 自动衔接补位筛选；
+- `STUCK_STOPLOSS_HOURS=0` 关闭止损（回到纯"不亏卖"死等模式）。
+
+### 5.3f 熔断机制（v1.4 新增，tick 级快速断路器）
 
 信号/趋势通道是分钟级的，闪崩时反应不及。熔断走 **tick 级价格通道**（复用每 3 秒
 的行情，零额外开销），内存维护滚动价格窗：
@@ -242,6 +253,11 @@ range_pct = clamp(ADAPTIVE_RANGE_MULT × ATR%, RANGE_PCT_MIN, RANGE_PCT_MAX)
 | `CB_AUTO_RESUME` | `true` | 企稳后自动恢复 |
 | `CB_RESUME_STABLE_MIN` | `30` | 企稳判定：不再创新低的分钟数 |
 | `AUTO_RECENTER` | `true` | 价格跑出区间自动重建网格 |
+
+> **Web 参数配置**：上表中大部分数值型参数（轮询间隔、费率、信号阈值、再平衡、
+> 止损、熔断、筛选等 19 项）可在面板顶部"⚙ 参数"区域直接修改——悬停参数名有
+> 气泡说明，改动即时生效并保存到本地 `trading/data/overrides.json`（重启自动加载），
+> 对所有策略全局生效。
 | `TOTAL_QUOTE_BUDGET` | `233` | 模拟盘虚拟 USDT 总预算 |
 | `DYNAMIC_ALLOCATION` | `true` | 按 ATR% 波动率动态分配预算；`false` 均分 |
 | `ALLOC_MIN_W` / `ALLOC_MAX_W` | `0.15` / `0.60` | 单币对预算占比下限/上限 |

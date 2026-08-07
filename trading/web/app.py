@@ -75,6 +75,23 @@ async def api_control(req: dict) -> JSONResponse:
     return JSONResponse({"ok": True, "run_status": status})
 
 
+@app.get("/api/settings")
+async def api_settings() -> JSONResponse:
+    from trading import settings
+    return JSONResponse(settings.current())
+
+
+@app.post("/api/settings")
+async def api_settings_update(req: dict) -> JSONResponse:
+    """修改运行参数：即时生效并持久化到本地（对所有策略全局生效）。"""
+    from trading import settings
+    try:
+        accepted = settings.apply((req or {}).get("updates", {}))
+    except (ValueError, TypeError) as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    return JSONResponse({"ok": True, "accepted": accepted})
+
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket) -> None:
     await websocket.accept()

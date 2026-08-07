@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Optional
 
 from . import config as _cfg
@@ -66,6 +67,10 @@ class GridBot:
         # 持仓移动平均成本（USDT/个，含买费）：买入时加权更新，清空时归 None。
         # 重建/补挂不改写它——成本属于存货，不属于订单。
         self.avg_cost: Optional[float] = None
+        # 水下计时：现价低于平均成本的持续起点（None=不在水下）
+        self.underwater_since: Optional[float] = None
+        # 止损冷却截止时间：此时间前不接新买单
+        self.no_buy_until: float = 0.0
         self.regime = "ranging"  # 行情状态（引擎写入）：ranging/trend_up/trend_down
         # 再平衡资金调拨累计（USDT 净流入）：盈亏基准随之调整，
         # 避免资金调拨被误计为交易亏损（引擎在再平衡时写入）
@@ -104,10 +109,12 @@ class GridBot:
                     "base_amount": quote_per / self.levels[i],
                 }
                 self._notify_order(self.orders[i])
-        if base_per > 0:
-            self.avg_cost = price  # 初始库存以启动市值为成本基准
+        if base_per > 0 and self.avg_cost is None:
+            self.avg_cost = price  # 初始库存以启动市值为成本基准（已有成本不覆盖）
         for i in sell_levels:
-            if base_per > 0 and not self._blocked("sell"):
+            # 不亏卖：档位低于持仓平均成本时不挂（等价格回到成本上方）
+            if (base_per > 0 and not self._blocked("sell")
+                    and (self.avg_cost is None or self.levels[i] > self.avg_cost)):
                 self.orders[i] = {
                     "side": "sell",
                     "price": self.levels[i],
@@ -117,7 +124,10 @@ class GridBot:
 
     # ------------------------------------------------------------------
     def _blocked(self, side: str) -> bool:
-        """趋势信号拦截：偏空(-1)不接买单，偏多(+1)不卖。"""
+        """趋势信号拦截：偏空(-1)不接买单，偏多(+1)不卖；止损冷却期不接买单。"""
+        if side == "buy" and time.time() < self.no_buy_until:
+            self.blocked_count += 1
+            return True
         if side == "buy" and self.signal == -1:
             self.blocked_count += 1
             return True
@@ -125,6 +135,45 @@ class GridBot:
             self.blocked_count += 1
             return True
         return False
+
+    # ------------------------------------------------------------------
+    def _check_stoploss(self, price: float, bal: dict,
+                        record: Optional[Callable[[dict], None]],
+                        fills: list[dict]) -> None:
+        """水下限时持有：超过 STUCK_STOPLOSS_HOURS 无高于成本的成交 → 市价止损。"""
+        underwater = (bal["base"] > 0 and self.avg_cost is not None
+                      and price < self.avg_cost)
+        if not underwater:
+            self.underwater_since = None
+            return
+        if self.underwater_since is None:
+            self.underwater_since = time.time()
+            return
+        hours = _cfg.STUCK_STOPLOSS_HOURS
+        if hours <= 0:
+            return  # 关闭止损
+        if time.time() - self.underwater_since < hours * 3600:
+            return
+        # 触发止损：全部持仓按现价卖出（亏损落账）
+        amount = bal["base"]
+        fee = amount * price * self.fee_rate
+        proceeds = amount * price - fee
+        profit = proceeds - amount * self.avg_cost
+        self.total_fees += fee
+        self.realized_profit += profit
+        bal["base"] = 0.0
+        bal["quote"] += proceeds
+        self.avg_cost = None
+        self.underwater_since = None
+        self.no_buy_until = time.time() + _cfg.STOPLOSS_COOLDOWN_MIN * 60
+        # 止损后卖单已无意义，撤掉；买单保留待补位/冷却后被替换或恢复
+        self.orders = {i: o for i, o in self.orders.items() if o["side"] != "sell"}
+        fill = {
+            "pair": self.pair, "side": "sell", "price": price,
+            "amount": amount, "quote": proceeds, "profit": profit,
+            "fee": fee, "stoploss": True,
+        }
+        self._on_fill(fill, record, fills)
 
     # ------------------------------------------------------------------
     def step(
@@ -136,6 +185,7 @@ class GridBot:
         """用最新成交价撮合一次，返回本次成交列表。"""
         fills: list[dict] = []
         bal = account.get(self.pair)
+        self._check_stoploss(price, bal, record, fills)  # 水下超时先止损
 
         for idx, order in list(self.orders.items()):
             if idx not in self.orders:  # 可能已被本轮处理
@@ -263,7 +313,9 @@ class GridBot:
             return
         base_per = bal["base"] / len(sell_levels)
         for i in sell_levels:
-            if base_per > 0 and not self._blocked("sell"):
+            # 不亏卖：低于持仓平均成本的档位不挂
+            if (base_per > 0 and not self._blocked("sell")
+                    and (self.avg_cost is None or self.levels[i] > self.avg_cost)):
                 self.orders[i] = {
                     "side": "sell",
                     "price": self.levels[i],
@@ -314,6 +366,8 @@ class GridBot:
             "capital_adjust": self.capital_adjust,
             "ever_held": self.ever_held,
             "avg_cost": self.avg_cost,
+            "underwater_since": self.underwater_since,
+            "no_buy_until": self.no_buy_until,
             "orders": {str(i): o for i, o in self.orders.items()},
             "quote": bal["quote"],
             "base": bal["base"],
@@ -333,6 +387,8 @@ class GridBot:
         bot.capital_adjust = data.get("capital_adjust", 0.0)
         bot.ever_held = data.get("ever_held", False)
         bot.avg_cost = data.get("avg_cost")
+        bot.underwater_since = data.get("underwater_since")
+        bot.no_buy_until = data.get("no_buy_until", 0.0)
         # 旧存档无 avg_cost：有持仓时以启动价兜底
         if bot.avg_cost is None and data.get("base", 0) > 0:
             bot.avg_cost = data.get("start_price")

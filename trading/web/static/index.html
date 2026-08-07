@@ -200,6 +200,30 @@
   .strat-tab .pnl { font-weight: 400; font-size: 11px; margin-left: 6px; }
   .strat-tab .pnl.up { color: var(--green); } .strat-tab.active .pnl.up { color: #3fb950; }
   .strat-tab .pnl.down { color: var(--red); } .strat-tab.active .pnl.down { color: #ff8a80; }
+
+  /* ===== 参数配置面板 ===== */
+  .settings-panel { display: none; margin-bottom: 10px; }
+  .settings-panel.open { display: block; }
+  .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+  .settings-group h3 { font-size: 11px; letter-spacing: 2px; border-bottom: 1px solid var(--ink); padding-bottom: 3px; margin-bottom: 6px; }
+  .set-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; gap: 6px; }
+  .set-row .tip {
+    font-size: 11px; border-bottom: 1px dashed #8b949e; cursor: help; position: relative;
+  }
+  .set-row input {
+    width: 80px; font-family: inherit; font-size: 11px; padding: 2px 6px;
+    border: 1px solid var(--ink); background: #fff; text-align: right;
+  }
+  .set-row input.saved { border-color: var(--green); }
+  .tip::after {
+    content: attr(data-tip); position: absolute; left: 0; bottom: 135%; z-index: 30;
+    background: var(--ink); color: #f2efe6; font-size: 10px; line-height: 1.6;
+    padding: 6px 9px; width: 230px; border-radius: 4px; letter-spacing: 0;
+    white-space: normal; opacity: 0; pointer-events: none; transition: opacity .15s;
+    box-shadow: 3px 3px 0 rgba(20,22,26,.35);
+  }
+  .tip:hover::after { opacity: 1; }
+  .settings-note { font-size: 10px; color: var(--dim); margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -212,6 +236,7 @@
   <span class="chip">权益 <b class="mono-num" id="chipEquity">-</b></span>
   <span class="chip">已实现 <b class="mono-num" id="chipRealized">-</b></span>
   <span class="spacer"></span>
+  <button class="btn" onclick="toggleSettings()">⚙ 参数</button>
   <button class="btn start" id="btnStart" onclick="control('start')">▶ 开始</button>
   <button class="btn pause" id="btnPause" onclick="control('pause')">⏸ 暂停</button>
   <button class="btn stop" id="btnStop" onclick="control('stop')">⏹ 停止</button>
@@ -224,6 +249,15 @@
 
 <!-- ===== 滚动行情条 ===== -->
 <div class="ticker-wrap"><div class="ticker" id="ticker"><span class="lbl">LIVE FEED</span>&nbsp;&nbsp;连接中…</div></div>
+
+<!-- ===== 参数配置面板 ===== -->
+<div class="panel settings-panel" id="settingsPanel">
+  <div class="panel-head">参数配置 <span class="tag">SETTINGS · 鼠标悬停参数名查看说明 · 修改即时生效并本地保存</span></div>
+  <div class="panel-body">
+    <div class="settings-grid" id="settingsGrid"></div>
+    <div class="settings-note">⚠ 参数对所有策略全局生效；保存于本地 trading/data/overrides.json，重启自动加载。</div>
+  </div>
+</div>
 
 <!-- ===== 状态栏 ===== -->
 <div class="statusbar">
@@ -765,6 +799,48 @@ async function control(action) {
   } catch (e) { alert('操作失败: ' + e); }
 }
 
+/* ================= 参数配置面板 ================= */
+let settingsLoaded = false;
+
+function toggleSettings() {
+  const p = $('settingsPanel');
+  p.classList.toggle('open');
+  if (p.classList.contains('open') && !settingsLoaded) loadSettings();
+}
+
+async function loadSettings() {
+  const r = await fetch('/api/settings');
+  const items = await r.json();
+  const groups = {};
+  items.forEach(it => (groups[it.group] = groups[it.group] || []).push(it));
+  $('settingsGrid').innerHTML = Object.entries(groups).map(([g, arr]) =>
+    `<div class="settings-group"><h3>${g}</h3>` + arr.map(it =>
+      `<div class="set-row">
+        <span class="tip" data-tip="${esc(it.desc)}">${it.label}</span>
+        <input type="number" id="set-${it.key}" value="${it.value}"
+               min="${it.min}" max="${it.max}" step="${it.step}"
+               onchange="saveSetting('${it.key}', this)">
+      </div>`).join('') + '</div>'
+  ).join('');
+  settingsLoaded = true;
+}
+
+async function saveSetting(key, input) {
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates: { [key]: input.value } }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      input.classList.add('saved');
+      setTimeout(() => input.classList.remove('saved'), 1200);
+    } else {
+      alert('保存失败: ' + d.error);
+    }
+  } catch (e) { alert('保存失败: ' + e); }
+}
+
 /* ================= 策略选项卡 ================= */
 function renderTabs(list) {
   const el = $('stratTabs');
@@ -812,6 +888,7 @@ setInterval(() => {
 /* ================= 启动 ================= */
 buildTree();
 window.addEventListener('resize', drawWires);
+if (location.hash === '#settings') toggleSettings();  // 支持 #settings 直达
 
 // 先取策略列表与默认策略全量状态，再开 WS
 fetch('/api/strategies').then(r => r.json()).then(meta => {

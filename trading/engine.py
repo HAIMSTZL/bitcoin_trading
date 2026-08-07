@@ -214,6 +214,8 @@ class Engine:
                         bot.blocked_count = d.get("blocked_count", 0)
                         bot.total_fees = d.get("total_fees", 0.0)
                         bot.ever_held = d.get("ever_held", False)
+                        bot.avg_cost = d.get("avg_cost")
+                        self._drop_below_cost_sells(bot)
                         self.bots[pair] = bot
                 log.info(
                     "已恢复上次模拟盘状态: %s",
@@ -321,6 +323,15 @@ class Engine:
         )
         return bot
 
+    @staticmethod
+    def _drop_below_cost_sells(bot) -> None:
+        """重建后摘除低于持仓成本的卖单（不亏卖，等价格回到成本上方）。"""
+        if bot.avg_cost is not None:
+            bot.orders = {
+                i: o for i, o in bot.orders.items()
+                if not (o["side"] == "sell" and o["price"] <= bot.avg_cost)
+            }
+
     def _recenter(self, pair: str, price: float) -> None:
         """价格跑出网格区间：以当前价为中心重建网格，保留余额与利润累计。"""
         old = self.bots[pair]
@@ -330,6 +341,8 @@ class Engine:
         bot.trade_count = old.trade_count
         bot.blocked_count = old.blocked_count
         bot.total_fees = old.total_fees
+        bot.avg_cost = old.avg_cost
+        self._drop_below_cost_sells(bot)
         self.bots[pair] = bot
         log.warning("%s 价格 %.6g 跑出区间 [%.6g, %.6g]，网格已重建", pair, price, old.lower, old.upper)
         self._event(
@@ -464,6 +477,8 @@ class Engine:
         )
         side = "买入" if fill["side"] == "buy" else "卖出"
         sweep = "（清仓扫尾）" if fill.get("sweep") else ""
+        if fill.get("stoploss"):
+            sweep = "（水下超时止损）"
         self._event(
             "INFO", "order_filled",
             f"{side}成交{sweep} @ {fill['price']:.8g} 数量 {fill['amount']:.8g} "
@@ -806,6 +821,8 @@ class Engine:
                 bot.trade_count = old.trade_count
                 bot.blocked_count = old.blocked_count
                 bot.total_fees = old.total_fees
+                bot.avg_cost = old.avg_cost
+                self._drop_below_cost_sells(bot)
                 # 重建后新基准已含调拨资金，调整量清零
                 bot.capital_adjust = 0.0
                 self.bots[pair] = bot
