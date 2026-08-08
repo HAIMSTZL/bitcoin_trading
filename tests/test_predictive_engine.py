@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from trading.predictive import PredictiveSettings
+from trading import config
+from trading.backtest import Candle
+from trading.predictive import PredictiveSettings, save_market_snapshot
 from trading.predictive_engine import PredictivePaperEngine
 from trading.profiles import PROFILES
 
@@ -49,3 +51,54 @@ def test_predictive_rebalance_charges_costs_and_can_return_to_usdt():
     # 双边费用/滑点后，回到现金的权益应低于 100，且不会产生负现金。
     assert 0 < engine.quote < 100
     assert engine.quote >= 0
+
+
+def test_predictive_rebalance_records_signal_and_ticker_audit_data():
+    engine, fills = _paper_engine_for_rebalance()
+    audit = {
+        "signal_candle_ts": 123,
+        "decision_ts": 124.5,
+        "ticker_observed_at": 124.4,
+        "price_source": "live_ticker_after_closed_candle",
+    }
+    engine._rebalance(("AAA_USDT",), audit)
+    assert fills[0]["market_mid"] == 100.0
+    assert {key: fills[0][key] for key in audit} == audit
+
+
+def test_predictive_engine_constructor_is_nonblocking_and_keyless(tmp_path, monkeypatch):
+    """构造阶段只打开本地状态；网络预热必须留给后台线程。"""
+    monkeypatch.setattr(config, "PREDICTIVE_CACHE_PATH", str(tmp_path / "missing-cache.json"))
+    profile = SimpleNamespace(
+        kind="predictive", pairs=("AAA_USDT", "BBB_USDT"),
+        db_path=str(tmp_path / "paper.db"), name="predictive", label="test",
+    )
+    engine = PredictivePaperEngine(profile)
+    try:
+        assert engine.run_status == "initializing"
+        assert engine.prices == {"AAA_USDT": 0.0, "BBB_USDT": 0.0}
+        assert engine.candles == {}
+    finally:
+        engine.stop()
+
+
+def test_predictive_cache_is_loaded_without_network(tmp_path):
+    path = tmp_path / "predictive.json"
+    pairs = ("AAA_USDT", "BBB_USDT")
+    candles = {
+        pair: [Candle(i * 3600, 1, 1, 1, 1) for i in range(200)]
+        for pair in pairs
+    }
+    save_market_snapshot(path, candles)
+    engine = PredictivePaperEngine.__new__(PredictivePaperEngine)
+    engine.pairs = list(pairs)
+    engine.settings = PredictiveSettings(pairs=pairs, train_bars=72, horizon_bars=2)
+    engine._cache_path = path
+    engine.candles = {}
+    events = []
+    engine._event = lambda *args, **kwargs: events.append((args, kwargs))
+
+    engine._load_cached_history()
+
+    assert len(engine.candles["AAA_USDT"]) == 200
+    assert any(args[1] == "predictive_cache" for args, _ in events)

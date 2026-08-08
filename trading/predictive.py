@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Literal, Sequence
 
 import numpy as np
+
+from gate_api import GatePublicClient
 
 from . import config
 from .backtest import Candle, fetch_gate_candles, interval_seconds
@@ -203,12 +206,20 @@ def _format_ts(ts: int) -> str:
 
 
 def save_market_snapshot(path: str | Path, candles_by_pair: dict[str, Sequence[Candle]]) -> None:
-    """保存原始公共 K 线快照，便于同一历史样本上的可复现参数比较。"""
+    """原子保存公共 K 线快照，避免进程中断留下半写入缓存。"""
     payload = {
         pair: [asdict(candle) for candle in candles]
         for pair, candles in candles_by_pair.items()
     }
-    Path(path).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        # os.replace 成功后临时文件不存在；失败时也不残留损坏的候选缓存。
+        temporary.unlink(missing_ok=True)
 
 
 def load_market_snapshot(path: str | Path, pairs: Sequence[str]) -> dict[str, list[Candle]]:
@@ -620,10 +631,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cache_path and cache_path.exists():
         candles = load_market_snapshot(cache_path, settings.pairs)
     else:
-        candles = {
-            pair: fetch_gate_candles(pair, args.interval, start_ts, end_ts)
-            for pair in settings.pairs
-        }
+        client = GatePublicClient(timeout=20.0)
+        try:
+            candles = {
+                pair: fetch_gate_candles(pair, args.interval, start_ts, end_ts, client=client)
+                for pair in settings.pairs
+            }
+        finally:
+            client.close()
         if cache_path:
             save_market_snapshot(cache_path, candles)
     result = run_predictive_backtest(candles, args.interval, settings)

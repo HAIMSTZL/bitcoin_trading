@@ -17,7 +17,7 @@ import time
 import traceback
 from typing import Any, Optional
 
-from gate_api import GateClient, SpotAPI
+from gate_api import GateClient, GatePublicClient, SpotAPI
 
 from . import config
 from . import screener
@@ -31,21 +31,39 @@ log = logging.getLogger("trading.engine")
 # 既保证 A/B 对照看到同一时间戳的价格，也减少重复请求。
 _TICKER_CACHE: dict = {"ts": 0.0, "data": {}}
 _TICKER_TTL = 2.0
+_TICKER_LOCK = threading.Lock()
+_PUBLIC_TICKER_SPOT = SpotAPI(GatePublicClient(timeout=20.0, retries=3))
 
 
-def _fetch_tickers_cached(spot: SpotAPI, pairs) -> dict[str, float]:
-    now = time.time()
-    cache = _TICKER_CACHE
-    if now - cache["ts"] < _TICKER_TTL and all(p in cache["data"] for p in pairs):
-        return {p: cache["data"][p] for p in pairs}
-    data = {}
-    for pair in pairs:
-        tickers = spot.list_tickers(pair)
-        if tickers:
-            data[pair] = float(tickers[0]["last"])
-    cache["data"].update(data)
-    cache["ts"] = time.time()
-    return data
+def _fetch_tickers_cached(spot: SpotAPI | None, pairs) -> dict[str, float]:
+    """从一次全市场 ticker 响应中取所需币对，并跨引擎去重。
+
+    原实现按币对逐个请求；预测策略的十币池会把高频行情请求放大到每秒数次。
+    Gate 支持不传 ``currency_pair`` 的批量 ticker。本函数默认使用一个无 Key 的
+    ``GatePublicClient``，并由互斥锁保护，使同一轮多策略 tick 最多触发一次 HTTP 请求。
+    ``spot`` 仅为单元测试或显式注入保留；生产引擎应传 ``None``。
+    """
+    requested = tuple(sorted(set(pairs)))
+    with _TICKER_LOCK:
+        now = time.time()
+        cache = _TICKER_CACHE
+        if now - cache["ts"] < _TICKER_TTL and all(p in cache["data"] for p in requested):
+            return {p: cache["data"][p] for p in requested}
+        rows = (spot or _PUBLIC_TICKER_SPOT).list_tickers()
+        data = {}
+        for row in rows or []:
+            pair = row.get("currency_pair")
+            if pair in requested:
+                try:
+                    data[pair] = float(row["last"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+        missing = [pair for pair in requested if pair not in data]
+        if missing:
+            raise RuntimeError(f"ticker 响应缺少币对: {', '.join(missing)}")
+        cache["data"].update(data)
+        cache["ts"] = time.time()
+        return {p: cache["data"][p] for p in requested}
 
 
 class LiveExecutor:
@@ -179,7 +197,7 @@ class Engine:
         补位换币可能把 BTC 换出序列，不能让大盘熔断失明）。
         多引擎共享 _TICKER_CACHE，同一批行情供所有策略。
         """
-        return _fetch_tickers_cached(self.spot, set(self.pairs) | {"BTC_USDT"})
+        return _fetch_tickers_cached(None, set(self.pairs) | {"BTC_USDT"})
 
     def _real_spot_balances(self) -> dict[str, float]:
         return {a["currency"]: float(a["available"]) for a in self.spot.list_accounts()}

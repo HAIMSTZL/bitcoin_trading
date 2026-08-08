@@ -582,6 +582,12 @@ function updateTree(s) {
       if (el) el.classList.toggle('active', active.has(id));
     });
     const strip = $('actionStrip');
+    if (!p.ready) {
+      strip.textContent = p.init_error
+        ? `预测行情预热失败，正在自动重试：${p.init_error}`
+        : '预测行情预热中：优先读取本地 K 线缓存，再补齐最新已收盘 K 线';
+      return;
+    }
     const target = (p.target || []).map(x => x.replace('_USDT', '')).join(' / ');
     strip.textContent = target
       ? `Ridge 预测轮动 · 目标 ${target} · ${p.horizon_hours || 48}h 预测 · 每 ${p.rebalance_hours || 24}h 决策`
@@ -630,7 +636,7 @@ function updateTree(s) {
 }
 
 /* ================= 渲染 ================= */
-const STATUS_TEXT = { running: '运行中', paused: '已暂停/待开始', stopped: '已停止' };
+const STATUS_TEXT = { running: '运行中', paused: '已暂停/待开始', stopped: '已停止', initializing: '行情预热中' };
 const EVENT_TYPE_TEXT = {
   lifecycle: '生命周期', grid_init: '网格初始化', order_placed: '挂单',
   order_filled: '成交', control: '控制', tick_error: '异常', live_order_error: '实盘异常',
@@ -638,6 +644,10 @@ const EVENT_TYPE_TEXT = {
   rebalance: '再平衡', regime_change: '行情切换',
   circuit_breaker: '⛔ 熔断', circuit_resume: '✅ 熔断恢复',
   api_outage: '🔌 API中断', api_recovered: '🔌 API恢复',
+  predictive_init: '预测预热', predictive_ready: '预测就绪',
+  predictive_init_error: '预测预热异常', predictive_cache: 'K线缓存',
+  predictive_cache_invalid: 'K线缓存无效', predictive_cache_error: 'K线缓存异常',
+  predictive_history_partial: 'K线部分失败',
   screen_start: '🔍 开始筛选', screen_none: '🔍 无合格候选', screen_error: '🔍 筛选失败',
   slot_replace: '🔄 槽位替换',
   predictive_history: '🧠 预测历史', predictive_train: '🧠 模型训练',

@@ -4,6 +4,7 @@ from trading.backtest import (
     BacktestSettings,
     Candle,
     _max_drawdown_pct,
+    fetch_gate_candles,
     parse_gate_candles,
     run_classic_backtest,
 )
@@ -19,6 +20,23 @@ def test_parse_gate_candles_sorts_deduplicates_and_drops_unfinished():
     candles = parse_gate_candles(rows)
     assert [c.ts for c in candles] == [1, 2]
     assert candles[1].close == 12
+
+
+def test_fetch_candles_uses_injected_api_client_instead_of_raw_requests():
+    class PublicClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params):
+            self.calls.append((path, params))
+            return [["60", "0", "10", "11", "9", "10", "0", "true"]]
+
+    client = PublicClient()
+    candles = fetch_gate_candles("BTC_USDT", "1m", 1, 61, client=client)
+    assert len(client.calls) == 1
+    assert client.calls[0][0] == "/spot/candlesticks"
+    assert client.calls[0][1]["currency_pair"] == "BTC_USDT"
+    assert candles == [Candle(60, 10, 11, 9, 10)]
 
 
 def test_max_drawdown_uses_running_equity_peak():

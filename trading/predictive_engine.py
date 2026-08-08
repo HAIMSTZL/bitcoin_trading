@@ -12,11 +12,12 @@ import math
 import threading
 import time
 import traceback
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from gate_api import GateClient, SpotAPI
+from gate_api import GatePublicClient
 
 from . import config
 from .backtest import Candle, fetch_gate_candles
@@ -27,7 +28,9 @@ from .predictive import (
     _align,
     _ema,
     _feature_matrix,
+    load_market_snapshot,
     _new_model,
+    save_market_snapshot,
     _training_set,
 )
 from .store import Store
@@ -66,8 +69,8 @@ class PredictivePaperEngine:
             # 研究结论表明 XGBoost 当前过拟合；纸盘固定使用 ridge 候选。
             model="ridge",
         )
-        self.client = GateClient(timeout=20.0)
-        self.spot = SpotAPI(self.client)
+        # 预测策略只读公开行情，不依赖交易 API Key；K 线和 ticker 都经由统一客户端。
+        self.client = GatePublicClient(timeout=20.0, retries=3)
         self.store = Store(profile.db_path)
         self.pairs = list(profile.pairs)
         self.prices: dict[str, float] = {pair: 0.0 for pair in self.pairs}
@@ -90,21 +93,24 @@ class PredictivePaperEngine:
         self._last_success: float | None = None
         self._api_outage = False
         self._last_history_refresh = 0.0
+        self._price_observed_at: float | None = None
         self._last_snapshot = 0.0
         self._last_health = 0.0
+        self._cache_path = Path(config.PREDICTIVE_CACHE_PATH)
+        self._ready = threading.Event()
+        self._initializing = True
+        self._init_error: str | None = None
+        self._next_init_attempt = 0.0
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._stopped = False
         self._thread: threading.Thread | None = None
 
         self._restore_or_seed()
-        self._load_initial_history()
-        self.prices = _fetch_tickers_cached(self.spot, self.pairs)
-        missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
-        if missing:
-            raise RuntimeError(f"未获取到预测币池行情: {', '.join(missing)}")
+        self._load_cached_history()
         # 和其他策略一致：面板显式点击“开始”才产生新的预测决策与虚拟成交。
         self._paused.set()
+        self._event("INFO", "predictive_init", "预测行情将在后台预热；Web 服务无需等待历史下载")
 
     # ------------------------------------------------------------------
     # 初始化、历史 K 线与持久化
@@ -174,18 +180,53 @@ class PredictivePaperEngine:
         log.info("预测策略读取 %d 天 1h 历史 K 线（%d 个币对）",
                  config.PREDICTIVE_HISTORY_DAYS, len(self.pairs))
         raw = {
-            pair: fetch_gate_candles(pair, "1h", start_ts, end_ts)
+            pair: fetch_gate_candles(pair, "1h", start_ts, end_ts, client=self.client)
             for pair in self.pairs
         }
         self.candles = _align(raw, self.pairs)
         self._assert_history_ready()
         self._last_history_refresh = time.time()
+        self._save_history_cache()
         latest = self.candles[self.pairs[0]][-1]
         self._event(
             "INFO", "predictive_history",
             f"已读取 {len(self.candles[self.pairs[0]])} 根共同 1h K 线，最新 {latest.ts}",
-            detail={"candles": len(self.candles[self.pairs[0]]), "latest_ts": latest.ts},
+            detail={"candles": len(self.candles[self.pairs[0]]), "latest_ts": latest.ts,
+                    "source": "full_download"},
         )
+
+    def _load_cached_history(self) -> None:
+        """快速恢复本地 K 线缓存；失败只降级为后台完整下载，不阻断服务。"""
+        if not self._cache_path.exists():
+            return
+        try:
+            cached = load_market_snapshot(self._cache_path, self.pairs)
+            self.candles = _align(cached, self.pairs)
+            self._assert_history_ready()
+        except Exception as error:
+            self.candles = {}
+            self._event(
+                "WARNING", "predictive_cache_invalid",
+                f"预测 K 线缓存不可用，将后台重新下载：{type(error).__name__}: {error}",
+            )
+            return
+        latest = self.candles[self.pairs[0]][-1]
+        self._event(
+            "INFO", "predictive_cache",
+            f"已从本地缓存恢复 {len(self.candles[self.pairs[0]])} 根共同 1h K 线",
+            detail={"path": str(self._cache_path), "candles": len(self.candles[self.pairs[0]]),
+                    "latest_ts": latest.ts},
+        )
+
+    def _save_history_cache(self) -> None:
+        try:
+            save_market_snapshot(self._cache_path, self.candles)
+        except Exception as error:
+            # 缓存失败不能中断已就绪的模拟盘，只记录供运维排查。
+            self._event(
+                "WARNING", "predictive_cache_error",
+                f"预测 K 线缓存保存失败：{type(error).__name__}: {error}",
+            )
 
     def _assert_history_ready(self) -> None:
         required = _WARMUP_BARS + self.settings.train_bars + self.settings.horizon_bars + 2
@@ -193,33 +234,71 @@ class PredictivePaperEngine:
         if count < required:
             raise RuntimeError(f"预测策略历史 K 线不足：需要 {required} 根，实际 {count} 根")
 
-    def _refresh_history(self) -> bool:
+    def _refresh_history(self, *, force: bool = False) -> bool:
         """低频合并最新已收盘 K 线；返回是否观察到新的共同 K 线。"""
+        if not self.candles:
+            raise RuntimeError("预测 K 线尚未初始化")
         now = time.time()
-        if now - self._last_history_refresh < config.PREDICTIVE_KLINE_REFRESH_SEC:
+        if not force and now - self._last_history_refresh < config.PREDICTIVE_KLINE_REFRESH_SEC:
             return False
         old_latest = self.candles[self.pairs[0]][-1].ts
         updates: dict[str, list[Candle]] = {}
+        failures: dict[str, str] = {}
         for pair in self.pairs:
             # 留两个小时重叠，防止接口边界、延迟或去重造成新收盘 K 线缺失。
             start_ts = self.candles[pair][-1].ts - 2 * 3600
-            updates[pair] = fetch_gate_candles(pair, "1h", start_ts, int(now))
+            try:
+                updates[pair] = fetch_gate_candles(
+                    pair, "1h", start_ts, int(now), client=self.client,
+                )
+            except Exception as error:
+                failures[pair] = f"{type(error).__name__}: {error}"
         limit = config.PREDICTIVE_HISTORY_DAYS * 24 + 8
         merged = {}
         for pair in self.pairs:
             by_ts = {candle.ts: candle for candle in self.candles[pair]}
-            by_ts.update({candle.ts: candle for candle in updates[pair]})
+            by_ts.update({candle.ts: candle for candle in updates.get(pair, ())})
             merged[pair] = [by_ts[ts] for ts in sorted(by_ts)[-limit:]]
         self.candles = _align(merged, self.pairs)
         self._assert_history_ready()
         self._last_history_refresh = now
-        return self.candles[self.pairs[0]][-1].ts > old_latest
+        changed = self.candles[self.pairs[0]][-1].ts > old_latest
+        if changed:
+            self._save_history_cache()
+        if failures:
+            self._event(
+                "WARNING", "predictive_history_partial",
+                f"预测 K 线刷新部分失败：{', '.join(sorted(failures))}；保留旧数据并等待下次刷新",
+                detail={"failures": failures, "latest_ts": self.candles[self.pairs[0]][-1].ts},
+            )
+        return changed
+
+    def _bootstrap_market_data(self) -> None:
+        """在引擎线程中完成缓存补齐和行情读取，避免构造函数阻塞 Web。"""
+        if self.candles:
+            self._refresh_history(force=True)
+        else:
+            self._load_initial_history()
+        self.prices = _fetch_tickers_cached(None, self.pairs)
+        missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
+        if missing:
+            raise RuntimeError(f"未获取到预测币池行情: {', '.join(missing)}")
+        self._price_observed_at = time.time()
+        self._ready.set()
+        self._initializing = False
+        self._init_error = None
+        self._event(
+            "INFO", "predictive_ready",
+            "预测行情预热完成，可开始前向模拟",
+            detail={"cache_path": str(self._cache_path),
+                    "latest_candle_ts": self.candles[self.pairs[0]][-1].ts},
+        )
 
     # ------------------------------------------------------------------
     # 模型决策和虚拟成交
     # ------------------------------------------------------------------
     def _fit_and_score(
-        self, *, emit_signal: bool = True,
+        self, *, emit_signal: bool = True, decision_audit: dict | None = None,
     ) -> tuple[tuple[str, ...], dict[str, float]]:
         count = len(self.candles[self.pairs[0]])
         index = count - 1
@@ -268,7 +347,7 @@ class PredictivePaperEngine:
                 ),
                 detail={"scores": scores, "target": target, "risk_on": risk_on,
                         "threshold": self.settings.expected_return_threshold,
-                        "candle_ts": current_candle.ts},
+                        "candle_ts": current_candle.ts, "execution": decision_audit or {}},
             )
         return target, scores
 
@@ -288,8 +367,9 @@ class PredictivePaperEngine:
     def _equity(self) -> float:
         return self.quote + sum(self.base[pair] * self.prices.get(pair, 0.0) for pair in self.pairs)
 
-    def _rebalance(self, target: tuple[str, ...]) -> None:
+    def _rebalance(self, target: tuple[str, ...], decision_audit: dict | None = None) -> None:
         """按当前 ticker 虚拟成交。先卖后买，逐侧计手续费和保守滑点。"""
+        decision_audit = decision_audit or {}
         equity = self._equity()
         target_value = equity / len(target) if target else 0.0
         slippage = self.settings.slippage_bps / 10_000
@@ -316,7 +396,8 @@ class PredictivePaperEngine:
             self.trade_count[pair] += 1
             self.total_fees += fee
             fills.append({"pair": pair, "side": "sell", "price": price, "amount": amount,
-                          "quote": gross, "profit": profit, "fee": fee})
+                          "quote": gross, "profit": profit, "fee": fee, "market_mid": mid,
+                          **decision_audit})
 
         # 以买入有效价计算目标缺口；现金不足时按同一比例缩放，绝不借贷。
         costs: dict[str, float] = {}
@@ -342,7 +423,8 @@ class PredictivePaperEngine:
             self.trade_count[pair] += 1
             self.total_fees += fee
             fills.append({"pair": pair, "side": "buy", "price": price, "amount": amount,
-                          "quote": spend, "profit": 0.0, "fee": fee})
+                          "quote": spend, "profit": 0.0, "fee": fee, "market_mid": self.prices[pair],
+                          **decision_audit})
         for fill in fills:
             self._record_fill(fill)
         self.target = target
@@ -350,7 +432,8 @@ class PredictivePaperEngine:
             "INFO", "predictive_rebalance",
             f"预测调仓：{'、'.join(target) if target else '全部回到 USDT'}，"
             f"成交 {len(fills)} 笔，权益 {self._equity():.2f}U",
-            detail={"target": target, "fills": fills, "equity": self._equity()},
+            detail={"target": target, "fills": fills, "equity": self._equity(),
+                    "execution": decision_audit},
         )
 
     def _maybe_decide(self) -> None:
@@ -373,9 +456,20 @@ class PredictivePaperEngine:
             return
         if not due:
             return
-        target, scores = self._fit_and_score()
+        signal_candle = self.candles[self.pairs[0]][-1]
+        decision_audit = {
+            # 回测以次根开盘近似；前向纸盘以信号收盘后实际取得的 ticker 成交，
+            # 两个时间点完整落库，后续可直接统计真实延迟和价格偏离。
+            "signal_candle_ts": signal_candle.ts,
+            "signal_close": signal_candle.close,
+            "decision_ts": time.time(),
+            "ticker_observed_at": self._price_observed_at,
+            "price_source": "live_ticker_after_closed_candle",
+            "slippage_bps": self.settings.slippage_bps,
+        }
+        target, scores = self._fit_and_score(decision_audit=decision_audit)
         self.predictions = scores
-        self._rebalance(target)
+        self._rebalance(target, decision_audit)
         self.last_decision_candle_ts = latest_ts
         self._save_state()
 
@@ -383,11 +477,13 @@ class PredictivePaperEngine:
     # 引擎循环、控制与 Web 状态
     # ------------------------------------------------------------------
     def tick(self) -> None:
-        self.prices = _fetch_tickers_cached(self.spot, self.pairs)
+        # 先确认已收盘 K 线，再读取成交用 ticker，避免使用刷新历史之前的旧报价。
+        self._refresh_history()
+        self.prices = _fetch_tickers_cached(None, self.pairs)
+        self._price_observed_at = time.time()
         missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
         if missing:
             raise RuntimeError(f"未获取到预测币池行情: {', '.join(missing)}")
-        self._refresh_history()
         self._maybe_decide()
         self.last_tick = time.time()
         self._save_state()
@@ -416,6 +512,26 @@ class PredictivePaperEngine:
                  config.PREDICTIVE_KLINE_REFRESH_SEC)
         self._event("INFO", "lifecycle", "预测模拟引擎线程启动")
         while not self._stop.is_set():
+            if not self._ready.is_set():
+                if time.time() < self._next_init_attempt:
+                    self._stop.wait(min(config.PREDICTIVE_INIT_RETRY_SEC, 1.0))
+                    continue
+                try:
+                    self._bootstrap_market_data()
+                    self._last_success = time.time()
+                except Exception as error:
+                    self._init_error = f"{type(error).__name__}: {error}"
+                    self.last_error = self._init_error
+                    self._next_init_attempt = time.time() + config.PREDICTIVE_INIT_RETRY_SEC
+                    log.exception("预测策略行情预热失败，将在 %.0f 秒后重试",
+                                  config.PREDICTIVE_INIT_RETRY_SEC)
+                    self._event(
+                        "ERROR", "predictive_init_error",
+                        f"预测行情预热失败，将自动重试：{self._init_error}",
+                        detail={"traceback": traceback.format_exc(),
+                                "retry_after_sec": config.PREDICTIVE_INIT_RETRY_SEC},
+                    )
+                continue
             if self._paused.is_set():
                 self._stop.wait(config.TICK_INTERVAL)
                 continue
@@ -453,7 +569,7 @@ class PredictivePaperEngine:
             return "stopped"
         self._paused.clear()
         self._event("INFO", "control", "用户开始/恢复预测模拟策略")
-        return "running"
+        return self.run_status
 
     def start(self) -> str:
         if self._stopped:
@@ -462,7 +578,7 @@ class PredictivePaperEngine:
             self._stopped = False
             self.start_background()
             self._event("INFO", "control", "用户重新启动预测模拟策略")
-            return "running"
+            return self.run_status
         return self.resume()
 
     def shutdown(self) -> str:
@@ -480,11 +596,14 @@ class PredictivePaperEngine:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         self.store.close()
+        self.client.close()
 
     @property
     def run_status(self) -> str:
         if self._stopped:
             return "stopped"
+        if not self._ready.is_set():
+            return "initializing"
         if self._paused.is_set():
             return "paused"
         return "running"
@@ -543,6 +662,9 @@ class PredictivePaperEngine:
                 "slippage_bps": self.settings.slippage_bps,
                 "last_decision_candle_ts": self.last_decision_candle_ts,
                 "last_refit_candle_ts": self.last_refit_candle_ts,
+                "ready": self._ready.is_set(), "initializing": self._initializing,
+                "init_error": self._init_error, "cache_path": str(self._cache_path),
+                "ticker_observed_at": self._price_observed_at,
             },
             "recent_trades": self.store.recent_trades(50),
             "recent_events": self.store.recent_events(50),

@@ -21,6 +21,8 @@ from typing import Callable, Iterable, Literal, Sequence
 
 import requests
 
+from gate_api import GatePublicClient
+
 from . import config
 from .grid import GridBot, PaperAccount
 
@@ -159,9 +161,14 @@ def fetch_gate_candles(
     start_ts: int,
     end_ts: int,
     *,
-    request: Callable[..., requests.Response] = requests.get,
+    request: Callable[..., requests.Response] | None = None,
+    client: GatePublicClient | None = None,
 ) -> list[Candle]:
-    """分段读取 Gate 公共历史 K 线，不需要 API 密钥。"""
+    """分段读取 Gate 公共历史 K 线，不需要 API Key。
+
+    生产调用使用 ``GatePublicClient``，从而复用代理策略、连接和重试机制。
+    ``request`` 仅保留给无网络单元测试注入假响应，不能作为生产默认路径。
+    """
     seconds = interval_seconds(interval)
     if end_ts <= start_ts:
         raise ValueError("end_ts 必须晚于 start_ts")
@@ -173,16 +180,19 @@ def fetch_gate_candles(
         # Gate 的 from/to 都是包含端点，且非整点起始时会向上取整 K 线。
         # 留出两个周期，避免服务端将边界判为超过 1,000 个数据点。
         segment_end = min(end_ts, cursor + seconds * (max_rows - 2))
-        response = request(
-            GATE_CANDLES_URL,
-            params={
-                "currency_pair": pair, "interval": interval,
-                "from": cursor, "to": segment_end, "limit": max_rows,
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-        chunk = response.json()
+        params = {
+            "currency_pair": pair, "interval": interval,
+            "from": cursor, "to": segment_end, "limit": max_rows,
+        }
+        if request is not None:
+            response = request(GATE_CANDLES_URL, params=params, timeout=20)
+            response.raise_for_status()
+            chunk = response.json()
+        else:
+            # 单个币对的分页共用一个会话；多币种调用方也可注入同一客户端。
+            if client is None:
+                client = GatePublicClient(timeout=20.0)
+            chunk = client.get("/spot/candlesticks", params)
         if not isinstance(chunk, list):
             raise ValueError(f"Gate K 线响应不是列表: {chunk!r}")
         raw.extend(chunk)
@@ -577,10 +587,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         initial_base_fraction=args.initial_base_fraction,
         grids=args.grids, downside_freeze=args.downside_freeze,
     )
-    candles = {
-        pair: fetch_gate_candles(pair, args.interval, start_ts, end_ts)
-        for pair in pairs
-    }
+    client = GatePublicClient(timeout=20.0)
+    try:
+        candles = {
+            pair: fetch_gate_candles(pair, args.interval, start_ts, end_ts, client=client)
+            for pair in pairs
+        }
+    finally:
+        client.close()
     result = run_classic_backtest(candles, args.interval, settings)
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))

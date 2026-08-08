@@ -12,7 +12,7 @@
     print(spot.list_accounts())
 """
 
-from .client import GateApiError, GateClient
+from .client import GateApiError, GateClient, GatePublicClient
 from .delivery import DeliveryAPI
 from .futures import FuturesAPI
 from .spot import SpotAPI
@@ -22,6 +22,7 @@ from .wallet import WalletAPI
 
 __all__ = [
     "GateClient",
+    "GatePublicClient",
     "GateApiError",
     "SpotAPI",
     "FuturesAPI",
