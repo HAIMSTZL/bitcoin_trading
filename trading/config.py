@@ -19,6 +19,9 @@ LIVE_CONFIRM = os.environ.get("LIVE_TRADING_CONFIRM", "")
 
 # ---- 行情轮询间隔（秒）----
 TICK_INTERVAL = float(os.environ.get("TICK_INTERVAL", "3"))
+# 网格引擎的首次行情预热失败时，保持 Web 服务可访问并在后台重试；不能因为
+# 某次网络抖动让整个进程退出。这个值仅控制下一次初始化尝试，不会延长 tick 锁。
+ENGINE_INIT_RETRY_SEC = float(os.environ.get("ENGINE_INIT_RETRY_SEC", "15"))
 
 # ---- 健康心跳间隔（秒）：每隔多久在运行日志里报一条"运行正常" ----
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "600"))
@@ -46,6 +49,8 @@ PREDICTIVE_CACHE_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "predictive_1h_cache.json"),
 )
 PREDICTIVE_INIT_RETRY_SEC = float(os.environ.get("PREDICTIVE_INIT_RETRY_SEC", "30"))
+# 共同已收盘 K 线晚于当前时间该阈值时，预测策略明确暂停调仓而非静默使用旧特征。
+PREDICTIVE_MAX_CANDLE_LAG_SEC = float(os.environ.get("PREDICTIVE_MAX_CANDLE_LAG_SEC", "7200"))
 # 已验证的研究候选：48h 预测、24h 调仓、120 天训练、每周重训、BTC 168h EMA 风控。
 PREDICTIVE_HORIZON_HOURS = int(os.environ.get("PREDICTIVE_HORIZON_HOURS", "48"))
 PREDICTIVE_TRAIN_DAYS = int(os.environ.get("PREDICTIVE_TRAIN_DAYS", "120"))
@@ -181,10 +186,12 @@ WEB_PORT = int(os.environ.get("WEB_PORT", "8000"))
 def validate() -> None:
     """启动时配置校验，非法配置直接 fail-fast。"""
     assert 0 < TICK_INTERVAL <= 60, "TICK_INTERVAL 应在 (0, 60] 秒"
+    assert ENGINE_INIT_RETRY_SEC >= 3, "网格引擎初始化重试间隔至少为 3 秒"
     assert TOTAL_QUOTE_BUDGET > 0, "TOTAL_QUOTE_BUDGET 必须为正"
     assert PREDICTIVE_HISTORY_DAYS >= PREDICTIVE_TRAIN_DAYS + 7, "预测策略历史窗口不足"
     assert PREDICTIVE_HORIZON_HOURS > 0 and PREDICTIVE_REBALANCE_HOURS > 0, "预测策略周期必须为正"
     assert PREDICTIVE_INIT_RETRY_SEC >= 3, "预测策略初始化重试间隔至少为 3 秒"
+    assert PREDICTIVE_MAX_CANDLE_LAG_SEC >= 3600, "预测策略 K 线最大滞后至少为 1 小时"
     assert 1 <= PREDICTIVE_MAX_POSITIONS <= len(PREDICTIVE_PAIRS), "预测策略持仓数非法"
     assert PREDICTIVE_SLIPPAGE_BPS >= 0, "预测策略滑点不能为负"
     assert 0 < ALLOC_MIN_W < ALLOC_MAX_W <= 1, "ALLOC_MIN_W/MAX_W 区间非法"

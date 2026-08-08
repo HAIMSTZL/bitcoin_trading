@@ -588,6 +588,10 @@ function updateTree(s) {
         : '预测行情预热中：优先读取本地 K 线缓存，再补齐最新已收盘 K 线';
       return;
     }
+    if (p.decision_paused) {
+      strip.textContent = `预测调仓已暂停：${p.decision_pause_reason || '共同 K 线已过期'}`;
+      return;
+    }
     const target = (p.target || []).map(x => x.replace('_USDT', '')).join(' / ');
     strip.textContent = target
       ? `Ridge 预测轮动 · 目标 ${target} · ${p.horizon_hours || 48}h 预测 · 每 ${p.rebalance_hours || 24}h 决策`
@@ -640,6 +644,7 @@ const STATUS_TEXT = { running: '运行中', paused: '已暂停/待开始', stopp
 const EVENT_TYPE_TEXT = {
   lifecycle: '生命周期', grid_init: '网格初始化', order_placed: '挂单',
   order_filled: '成交', control: '控制', tick_error: '异常', live_order_error: '实盘异常',
+  engine_init_error: '行情预热异常', engine_ready: '行情预热完成',
   health: '健康监测', grid_recenter: '网格重建', signal_change: '信号翻转',
   rebalance: '再平衡', regime_change: '行情切换',
   circuit_breaker: '⛔ 熔断', circuit_resume: '✅ 熔断恢复',
@@ -648,6 +653,7 @@ const EVENT_TYPE_TEXT = {
   predictive_init_error: '预测预热异常', predictive_cache: 'K线缓存',
   predictive_cache_invalid: 'K线缓存无效', predictive_cache_error: 'K线缓存异常',
   predictive_history_partial: 'K线部分失败',
+  predictive_decision_paused: '预测调仓暂停', predictive_decision_resumed: '预测调仓恢复',
   screen_start: '🔍 开始筛选', screen_none: '🔍 无合格候选', screen_error: '🔍 筛选失败',
   slot_replace: '🔄 槽位替换',
   predictive_history: '🧠 预测历史', predictive_train: '🧠 模型训练',

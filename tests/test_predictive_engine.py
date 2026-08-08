@@ -102,3 +102,24 @@ def test_predictive_cache_is_loaded_without_network(tmp_path):
 
     assert len(engine.candles["AAA_USDT"]) == 200
     assert any(args[1] == "predictive_cache" for args, _ in events)
+
+
+def test_stale_common_candle_pauses_and_then_resumes_decisions(monkeypatch):
+    engine = PredictivePaperEngine.__new__(PredictivePaperEngine)
+    engine.pairs = ["AAA_USDT"]
+    engine.candles = {"AAA_USDT": [Candle(0, 1, 1, 1, 1)]}
+    engine._decision_pause_reason = None
+    engine._candle_lag_seconds = None
+    events = []
+    engine._event = lambda *args, **kwargs: events.append((args, kwargs))
+    monkeypatch.setattr(config, "PREDICTIVE_MAX_CANDLE_LAG_SEC", 3600.0)
+    monkeypatch.setattr("trading.predictive_engine.time.time", lambda: 10_000.0)
+
+    engine._update_decision_freshness()
+    assert engine._decision_pause_reason is not None
+    assert any(args[1] == "predictive_decision_paused" for args, _ in events)
+
+    engine.candles["AAA_USDT"] = [Candle(7_000, 1, 1, 1, 1)]
+    engine._update_decision_freshness()
+    assert engine._decision_pause_reason is None
+    assert any(args[1] == "predictive_decision_resumed" for args, _ in events)

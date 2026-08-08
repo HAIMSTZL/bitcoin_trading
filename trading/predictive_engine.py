@@ -100,6 +100,8 @@ class PredictivePaperEngine:
         self._ready = threading.Event()
         self._initializing = True
         self._init_error: str | None = None
+        self._decision_pause_reason: str | None = None
+        self._candle_lag_seconds: float | None = None
         self._next_init_attempt = 0.0
         self._stop = threading.Event()
         self._paused = threading.Event()
@@ -186,6 +188,7 @@ class PredictivePaperEngine:
         self.candles = _align(raw, self.pairs)
         self._assert_history_ready()
         self._last_history_refresh = time.time()
+        self._update_decision_freshness()
         self._save_history_cache()
         latest = self.candles[self.pairs[0]][-1]
         self._event(
@@ -234,12 +237,42 @@ class PredictivePaperEngine:
         if count < required:
             raise RuntimeError(f"预测策略历史 K 线不足：需要 {required} 根，实际 {count} 根")
 
+    def _update_decision_freshness(self) -> None:
+        """共同 K 线过旧时暂停新决策，避免静默地以陈旧特征调仓。"""
+        latest = self.candles[self.pairs[0]][-1]
+        # Candle.ts 是该 1h K 线的开始时间；应从其收盘时刻计算可接受的延迟。
+        lag = max(0.0, time.time() - (latest.ts + 3600))
+        self._candle_lag_seconds = lag
+        if lag > config.PREDICTIVE_MAX_CANDLE_LAG_SEC:
+            if self._decision_pause_reason is None:
+                self._decision_pause_reason = (
+                    f"共同已收盘 K 线滞后 {lag / 3600:.2f}h，超过 "
+                    f"{config.PREDICTIVE_MAX_CANDLE_LAG_SEC / 3600:.2f}h 阈值"
+                )
+                self._event(
+                    "ERROR", "predictive_decision_paused",
+                    f"预测调仓已暂停：{self._decision_pause_reason}",
+                    detail={"latest_candle_ts": latest.ts, "lag_seconds": lag,
+                            "max_lag_seconds": config.PREDICTIVE_MAX_CANDLE_LAG_SEC},
+                )
+            return
+        if self._decision_pause_reason is not None:
+            previous = self._decision_pause_reason
+            self._decision_pause_reason = None
+            self._event(
+                "INFO", "predictive_decision_resumed",
+                "预测 K 线已恢复新鲜，重新允许调仓",
+                detail={"previous_reason": previous, "latest_candle_ts": latest.ts,
+                        "lag_seconds": lag},
+            )
+
     def _refresh_history(self, *, force: bool = False) -> bool:
         """低频合并最新已收盘 K 线；返回是否观察到新的共同 K 线。"""
         if not self.candles:
             raise RuntimeError("预测 K 线尚未初始化")
         now = time.time()
         if not force and now - self._last_history_refresh < config.PREDICTIVE_KLINE_REFRESH_SEC:
+            self._update_decision_freshness()
             return False
         old_latest = self.candles[self.pairs[0]][-1].ts
         updates: dict[str, list[Candle]] = {}
@@ -262,6 +295,7 @@ class PredictivePaperEngine:
         self.candles = _align(merged, self.pairs)
         self._assert_history_ready()
         self._last_history_refresh = now
+        self._update_decision_freshness()
         changed = self.candles[self.pairs[0]][-1].ts > old_latest
         if changed:
             self._save_history_cache()
@@ -279,7 +313,9 @@ class PredictivePaperEngine:
             self._refresh_history(force=True)
         else:
             self._load_initial_history()
-        self.prices = _fetch_tickers_cached(None, self.pairs)
+        # 这是后台预热而不是 tick：给四并发行情请求足够时间完成两三批，避免
+        # 网络正常但 RTT 略高于运行时 1 秒预算时反复预热失败。不会占用 ticker 锁。
+        self.prices = _fetch_tickers_cached(None, self.pairs, initial_wait_sec=8.0)
         missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
         if missing:
             raise RuntimeError(f"未获取到预测币池行情: {', '.join(missing)}")
@@ -437,6 +473,8 @@ class PredictivePaperEngine:
         )
 
     def _maybe_decide(self) -> None:
+        if self._decision_pause_reason is not None:
+            return
         latest_ts = self.candles[self.pairs[0]][-1].ts
         due = not self.last_decision_candle_ts or (
             latest_ts - self.last_decision_candle_ts
@@ -665,6 +703,9 @@ class PredictivePaperEngine:
                 "ready": self._ready.is_set(), "initializing": self._initializing,
                 "init_error": self._init_error, "cache_path": str(self._cache_path),
                 "ticker_observed_at": self._price_observed_at,
+                "decision_paused": self._decision_pause_reason is not None,
+                "decision_pause_reason": self._decision_pause_reason,
+                "candle_lag_seconds": self._candle_lag_seconds,
             },
             "recent_trades": self.store.recent_trades(50),
             "recent_events": self.store.recent_events(50),

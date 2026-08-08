@@ -29,47 +29,154 @@ log = logging.getLogger("trading.engine")
 
 # 多策略引擎共享的按币对行情缓存。Gate 的全市场 ticker 响应较大，不能每个
 # tick 下载全部交易对；这里仅请求策略实际需要的币池，并防止多策略重复拉取同一币。
-_TICKER_CACHE: dict = {"data": {}, "updated": {}}
+_TICKER_CACHE: dict = {"data": {}, "updated": {}, "failures": {}, "inflight": {}}
 _TICKER_TTL = 2.0
 _TICKER_LOCK = threading.Lock()
-_PUBLIC_TICKER_SPOT = SpotAPI(GatePublicClient(timeout=20.0, retries=3))
+_TICKER_THREAD_LOCAL = threading.local()
+# ticker 是可很快再次获取的非关键读；不能让单次网络抖动占满并发槽 80 秒。
+# 与会下单/读账户的客户端分开，使用短超时、一次重试的刷新预算。
+_TICKER_REFRESH_SLOTS = threading.BoundedSemaphore(4)
+_TICKER_REQUEST_TIMEOUT_SEC = 5.0
+_TICKER_REQUEST_RETRIES = 1
+_TICKER_INITIAL_WAIT_SEC = 1.0
+_TICKER_MAX_STALE_SEC = 30.0
+_TICKER_FAILURE_LIMIT = 3
+_TICKER_SLOW_REFRESH_SEC = 5.0
 
 
-def _fetch_tickers_cached(spot: SpotAPI | None, pairs) -> dict[str, float]:
-    """按实际币池读取小型 ticker 响应，并跨策略做逐币对缓存。
+def _thread_ticker_spot() -> SpotAPI:
+    """每个后台刷新线程使用独立 Session，避免跨线程共享 requests.Session。"""
+    spot = getattr(_TICKER_THREAD_LOCAL, "spot", None)
+    if spot is None:
+        spot = SpotAPI(GatePublicClient(
+            timeout=_TICKER_REQUEST_TIMEOUT_SEC,
+            retries=_TICKER_REQUEST_RETRIES,
+        ))
+        _TICKER_THREAD_LOCAL.spot = spot
+    return spot
 
-    Gate 的 ``/spot/tickers`` 仅支持单个 ``currency_pair`` 或全市场响应，并不支持
-    多币对参数。全市场响应在本地实测约 0.5MB，若按 3 秒轮询会产生不必要的大流量
-    和 ReadTimeout 风险。因此每个失效币对只发一个小请求；互斥锁保证不同策略在
-    同一 TTL 内不会重复请求同一币对。``spot`` 仅供测试/显式注入，生产传 ``None``。
-    """
-    requested = tuple(sorted(set(pairs)))
+
+def _parse_ticker_price(pair: str, rows) -> float:
+    if not rows:
+        raise RuntimeError(f"ticker 响应为空: {pair}")
+    try:
+        row = rows[0]
+        if row.get("currency_pair") not in (None, pair):
+            raise RuntimeError(f"ticker 响应币对不匹配: 期望 {pair}")
+        return float(row["last"])
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"ticker 响应无有效价格: {pair}") from error
+
+
+def _refresh_ticker_pair(pair: str, spot: SpotAPI | None, done: threading.Event) -> None:
+    """后台刷新一个币对；网络 I/O 永远不占用 ``_TICKER_LOCK``。"""
+    started = time.monotonic()
+    try:
+        # 限制总并发连接数，避免十币池启动时形成请求尖峰。
+        with _TICKER_REFRESH_SLOTS:
+            rows = (spot or _thread_ticker_spot()).list_tickers(pair)
+        price = _parse_ticker_price(pair, rows)
+    except Exception as error:
+        with _TICKER_LOCK:
+            cache = _TICKER_CACHE
+            failures = cache.setdefault("failures", {})
+            failures[pair] = int(failures.get(pair, 0)) + 1
+            cache.setdefault("inflight", {}).pop(pair, None)
+            attempts = failures[pair]
+        elapsed = time.monotonic() - started
+        log.warning("ticker 刷新失败: %s（连续 %d 次，耗时 %.2fs）：%s",
+                    pair, attempts, elapsed, error)
+    else:
+        with _TICKER_LOCK:
+            cache = _TICKER_CACHE
+            cache.setdefault("data", {})[pair] = price
+            cache.setdefault("updated", {})[pair] = time.time()
+            cache.setdefault("failures", {}).pop(pair, None)
+            cache.setdefault("inflight", {}).pop(pair, None)
+        elapsed = time.monotonic() - started
+        if elapsed >= _TICKER_SLOW_REFRESH_SEC:
+            log.warning("ticker 刷新偏慢: %s 耗时 %.2fs", pair, elapsed)
+    finally:
+        done.set()
+
+
+def _schedule_ticker_refresh(pair: str, spot: SpotAPI | None) -> tuple[float | None, threading.Event | None]:
+    """锁内只检查/登记缓存；真正的请求由后台线程在锁外完成。"""
+    now = time.time()
     with _TICKER_LOCK:
-        now = time.time()
         cache = _TICKER_CACHE
         data = cache.setdefault("data", {})
         updated = cache.setdefault("updated", {})
-        source = spot or _PUBLIC_TICKER_SPOT
-        stale = [
-            pair for pair in requested
-            if pair not in data or now - float(updated.get(pair, 0.0)) >= _TICKER_TTL
-        ]
-        for pair in stale:
-            rows = source.list_tickers(pair)
-            if not rows:
-                raise RuntimeError(f"ticker 响应为空: {pair}")
-            try:
-                row = rows[0]
-                if row.get("currency_pair") not in (None, pair):
-                    raise RuntimeError(f"ticker 响应币对不匹配: 期望 {pair}")
-                data[pair] = float(row["last"])
-                updated[pair] = time.time()
-            except (AttributeError, KeyError, TypeError, ValueError) as error:
-                raise RuntimeError(f"ticker 响应无有效价格: {pair}") from error
-        missing = [pair for pair in requested if pair not in data]
-        if missing:
-            raise RuntimeError(f"ticker 响应缺少币对: {', '.join(missing)}")
-        return {p: data[p] for p in requested}
+        current = data.get(pair)
+        if current is not None and now - float(updated.get(pair, 0.0)) < _TICKER_TTL:
+            return current, None
+        inflight = cache.setdefault("inflight", {})
+        done = inflight.get(pair)
+        if done is not None:
+            return current, done
+        done = threading.Event()
+        inflight[pair] = done
+    thread = threading.Thread(
+        target=_refresh_ticker_pair, args=(pair, spot, done), daemon=True,
+        name=f"ticker-refresh-{pair}",
+    )
+    thread.start()
+    return current, done
+
+
+def _cached_ticker_or_error(pair: str) -> float | None:
+    """允许有限时效的上一帧价格；连续失败或明显过期后升级为 tick 错误。"""
+    with _TICKER_LOCK:
+        cache = _TICKER_CACHE
+        value = cache.setdefault("data", {}).get(pair)
+        if value is None:
+            return None
+        age = time.time() - float(cache.setdefault("updated", {}).get(pair, 0.0))
+        failures = int(cache.setdefault("failures", {}).get(pair, 0))
+    if age > _TICKER_MAX_STALE_SEC or failures >= _TICKER_FAILURE_LIMIT:
+        return None
+    return value
+
+
+def _fetch_tickers_cached(
+    spot: SpotAPI | None, pairs, *, initial_wait_sec: float = _TICKER_INITIAL_WAIT_SEC,
+) -> dict[str, float]:
+    """只读缓存并安排后台 ticker 刷新，不让行情网络阻塞策略 tick。
+
+    Gate 的 ``/spot/tickers`` 仅支持单个 ``currency_pair`` 或全市场响应，并不支持
+    多币对参数。全市场响应在本地实测约 0.5MB，若按 3 秒轮询会产生不必要的大流量
+    和 ReadTimeout 风险。因此每个失效币对只发一个小请求。缓存锁只保护数据结构；
+    网络请求由最多四个后台线程执行；策略 tick 首次无缓存默认只等待一秒。后台
+    初始化调用者可显式提供较长窗口，但等待不占用缓存锁，也不阻塞 Web 服务。
+    ``spot`` 仅供测试/显式注入，生产传 ``None``。
+    """
+    requested = tuple(sorted(set(pairs)))
+    pending: dict[str, threading.Event] = {}
+    values: dict[str, float] = {}
+    for pair in requested:
+        value, done = _schedule_ticker_refresh(pair, spot)
+        if value is not None:
+            values[pair] = value
+        elif done is not None:
+            pending[pair] = done
+
+    # 首次启动没有上一帧价格时，只在一个共享截止时间内等后台请求，绝不逐币串行等待。
+    deadline = time.monotonic() + max(0.0, initial_wait_sec)
+    for done in pending.values():
+        done.wait(max(0.0, deadline - time.monotonic()))
+
+    missing = []
+    for pair in requested:
+        value = _cached_ticker_or_error(pair)
+        if value is None:
+            missing.append(pair)
+        else:
+            values[pair] = value
+    if missing:
+        raise RuntimeError(
+            f"ticker 无可用价格（预热中、连续失败或缓存过期）: {', '.join(missing)}"
+        )
+    return {pair: values[pair] for pair in requested}
 
 
 class LiveExecutor:
@@ -177,21 +284,16 @@ class Engine:
         # API 中断告警状态
         self._last_success: Optional[float] = None  # 最近一次成功 tick 时间
         self._api_outage = False  # 是否处于持续中断告警状态
-
-        self._init_bots()
-        if self.mode == "live":
-            self.executor = LiveExecutor(self.spot, self.pairs)
-        # 组合总盈亏基准：首次建仓时固定并持久化，网格重建/再平衡不重置（P2 修复）
+        # 行情预热不能阻塞 Web 服务，更不能因短暂网络故障让 run.py 退出。
+        # 由引擎线程在后台完成，并按 ENGINE_INIT_RETRY_SEC 自动重试。
+        self._ready = threading.Event()
+        self._initializing = True
+        self._init_error: Optional[str] = None
+        self._next_init_attempt = 0.0
+        # 组合总盈亏基准：首次成功建仓时固定并持久化；预热阶段尚无仓位时用 0 展示。
         ie = self.store.get_meta("initial_equity")
-        if ie is None:
-            self._initial_total = sum(
-                self.account.get(p)["quote"]
-                + self.account.get(p)["base"] * self.prices.get(p, 0.0)
-                for p in self.pairs
-            )
-            self.store.set_meta("initial_equity", str(self._initial_total))
-        else:
-            self._initial_total = float(ie)
+        self._initial_total = float(ie) if ie is not None else 0.0
+        self._initial_equity_persisted = ie is not None
         # 默认待命：服务启动后只初始化环境，等用户在 Web 面板点击"开始"才正式交易
         self._paused.set()
 
@@ -204,6 +306,37 @@ class Engine:
         多引擎共享 _TICKER_CACHE，同一批行情供所有策略。
         """
         return _fetch_tickers_cached(None, set(self.pairs) | {"BTC_USDT"})
+
+    def _initialize(self) -> None:
+        """在引擎线程中完成首次建仓，失败可安全重试。
+
+        这里刻意不在构造函数中访问行情：冷启动时 ticker 尚未到达只是“预热中”，
+        不是 Web 服务应该退出的致命错误。每次重试从空的内存仓位开始，避免半初始化
+        状态被下一次尝试复用。
+        """
+        self.account = PaperAccount()
+        self.bots = {}
+        self.prices = {}
+        self.executor = None
+        self.pairs = list(self.profile.pairs)
+        self._init_atr = {}
+        self._init_bots()
+        if self.mode == "live":
+            self.executor = LiveExecutor(self.spot, self.pairs)
+        if not self._initial_equity_persisted:
+            self._initial_total = sum(
+                self.account.get(p)["quote"]
+                + self.account.get(p)["base"] * self.prices.get(p, 0.0)
+                for p in self.pairs
+            )
+            self.store.set_meta("initial_equity", str(self._initial_total))
+            self._initial_equity_persisted = True
+        self._init_error = None
+        self.last_error = None
+        self._initializing = False
+        self._ready.set()
+        log.info("引擎行情预热完成，等待交易控制指令")
+        self._event("INFO", "engine_ready", "行情预热完成，网格已就绪")
 
     def _real_spot_balances(self) -> dict[str, float]:
         return {a["currency"]: float(a["available"]) for a in self.spot.list_accounts()}
@@ -906,6 +1039,26 @@ class Engine:
         log.info("引擎启动，模式=%s，轮询间隔=%ss", self.mode, config.TICK_INTERVAL)
         self._event("INFO", "lifecycle", f"引擎线程启动, 模式={self.mode}")
         while not self._stop.is_set():
+            if not self._ready.is_set():
+                now = time.monotonic()
+                if now >= self._next_init_attempt:
+                    try:
+                        self._initialize()
+                    except Exception as e:
+                        self._init_error = f"{type(e).__name__}: {e}"
+                        self.last_error = self._init_error
+                        self._next_init_attempt = now + config.ENGINE_INIT_RETRY_SEC
+                        log.exception("引擎行情预热失败，将在 %.0f 秒后重试",
+                                      config.ENGINE_INIT_RETRY_SEC)
+                        self._event(
+                            "ERROR", "engine_init_error",
+                            f"行情预热失败，将自动重试: {self._init_error}",
+                            detail={"traceback": traceback.format_exc()},
+                        )
+                # 不使用一次长 sleep，保证 shutdown/control 的响应速度。
+                wait_for = max(0.0, self._next_init_attempt - time.monotonic())
+                self._stop.wait(min(config.TICK_INTERVAL, wait_for or config.TICK_INTERVAL))
+                continue
             if self._paused.is_set():
                 self._stop.wait(config.TICK_INTERVAL)
                 continue
@@ -957,7 +1110,7 @@ class Engine:
         self._paused.clear()
         log.info("引擎已恢复运行")
         self._event("INFO", "control", "用户恢复交易引擎")
-        return "running"
+        return self.run_status
 
     def shutdown(self) -> str:
         """停止交易循环（不关闭存储，Web 服务退出时由 stop() 统一收尾）。"""
@@ -979,13 +1132,15 @@ class Engine:
             self.start_background()
             log.info("引擎已重新启动")
             self._event("INFO", "control", "用户重新启动交易引擎")
-            return "running"
+            return self.run_status
         return self.resume()
 
     @property
     def run_status(self) -> str:
         if self._stopped:
             return "stopped"
+        if not self._ready.is_set():
+            return "initializing"
         if self._paused.is_set():
             return "paused"
         return "running"
@@ -1010,6 +1165,8 @@ class Engine:
             "strategy": self.profile.name,
             "strategy_label": self.profile.label,
             "run_status": self.run_status,
+            "initializing": not self._ready.is_set(),
+            "initialization_error": self._init_error,
             "circuit_breaker": {
                 "global": self._cb_global,
                 "pairs": sorted(self._cb_pairs.keys()),
