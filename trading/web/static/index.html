@@ -115,7 +115,7 @@
     .fold > .tree-panel { flex: 1 1 0; min-height: 0; margin-bottom: 0; display: flex; flex-direction: column; }
     .fold > .row1 .panel-body, .fold > .row3 .panel-body { overflow: auto; }
     .fold > .tree-panel .panel-body { display: flex; flex-direction: column; min-height: 0; padding: 4px; }
-    .fold > .tree-panel .tree-canvas { flex: 1 1 0; height: auto; min-height: 120px; }
+    .fold > .tree-panel .tree-canvas { flex: 1 1 0; height: auto; min-height: 120px; transform: translateY(-5px); }
     .panel-head { padding: 3px 6px; font-size: 9px; }
     .panel-body { padding: 5px; }
     .big-num { font-size: 30px; }
@@ -583,7 +583,7 @@ function drawEquity(canvas, hist) {
 const NODES = [
   ['tick',   'TICK FEED',   '3s 轮询',    'circle blue', 7,  50],
   ['price',  '获取最新价',   'gate ticker','',            20, 50],
-  ['detect', '档位穿越检测', '',           'diamond',     35, 40],
+  ['detect', '档位穿越检测', '',           'diamond',     35, 35],
   ['wait',   '无穿越',       '等待下一TICK','gray',       35, 89],
   ['buy',    '买单成交',     '价格≤买档',   'blue',       52, 24],
   ['sell',   '卖单成交',     '价格≥卖档',   'red',        52, 74],
@@ -593,7 +593,7 @@ const NODES = [
 ];
 const WIRES = [
   ['tick', 'price', ''], ['price', 'detect', ''],
-  ['detect', 'wait', '无穿越'], ['wait', 'tick', ''],
+  ['detect', 'wait', ''], ['wait', 'tick', ''],
   ['detect', 'buy', '价格下穿'], ['buy', 'rebuy', ''],
   ['detect', 'sell', '价格上穿'], ['sell', 'resell', ''],
   ['rebuy', 'pnl', ''], ['resell', 'pnl', ''],
