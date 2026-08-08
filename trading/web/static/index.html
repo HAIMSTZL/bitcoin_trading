@@ -317,18 +317,6 @@
   </div>
 </div>
 
-<!-- ===== 决策树 ===== -->
-<div class="panel tree-panel row">
-  <div class="panel-head">网格策略决策流 <span class="tag">STRATEGY DECISION FLOW · 每次穿越都被追踪</span></div>
-  <div class="panel-body">
-    <div class="tree-canvas" id="treeCanvas">
-      <svg class="wires" id="treeWires"></svg>
-      <!-- 节点由 JS 定位 -->
-    </div>
-    <div class="action-strip mono-num" id="actionStrip">等待价格触及网格档位…</div>
-  </div>
-</div>
-
 <!-- ===== 第三排：权益曲线 / 成交流水 / 运行日志 ===== -->
 <div class="row row3">
   <div class="panel">
@@ -352,6 +340,18 @@
         <tbody id="events"></tbody>
       </table>
     </div>
+  </div>
+</div>
+
+<!-- ===== 决策树（视觉效果为主，置页面最底部） ===== -->
+<div class="panel tree-panel row">
+  <div class="panel-head">网格策略决策流 <span class="tag">STRATEGY DECISION FLOW · 每次穿越都被追踪</span></div>
+  <div class="panel-body">
+    <div class="tree-canvas" id="treeCanvas">
+      <svg class="wires" id="treeWires"></svg>
+      <!-- 节点由 JS 定位 -->
+    </div>
+    <div class="action-strip mono-num" id="actionStrip">等待价格触及网格档位…</div>
   </div>
 </div>
 
