@@ -61,6 +61,23 @@ PREDICTIVE_MAX_POSITIONS = int(os.environ.get("PREDICTIVE_MAX_POSITIONS", "3"))
 PREDICTIVE_MARKET_EMA = int(os.environ.get("PREDICTIVE_MARKET_EMA", "168"))
 # 模拟盘采用比研究默认值更保守的 10 bps 单侧滑点，先用实际观察校准。
 PREDICTIVE_SLIPPAGE_BPS = float(os.environ.get("PREDICTIVE_SLIPPAGE_BPS", "10"))
+
+# ---- DOGE 趋势恢复策略模拟盘（严格 paper-only）----
+# 单币策略仍使用独立缓存和数据库，避免和十币预测轮动争用/覆盖快照。
+DOGE_TREND_HISTORY_DAYS = int(os.environ.get("DOGE_TREND_HISTORY_DAYS", "150"))
+DOGE_TREND_KLINE_REFRESH_SEC = float(
+    os.environ.get("DOGE_TREND_KLINE_REFRESH_SEC", "300")
+)
+DOGE_TREND_CACHE_PATH = os.environ.get(
+    "DOGE_TREND_CACHE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "doge_trend_1h_cache.json"),
+)
+DOGE_TREND_INIT_RETRY_SEC = float(os.environ.get("DOGE_TREND_INIT_RETRY_SEC", "30"))
+# 最新已收盘 1h K 线超过此延迟时，暂停新增仓/加仓；已有仓位的止盈止损继续看 ticker。
+DOGE_TREND_MAX_CANDLE_LAG_SEC = float(
+    os.environ.get("DOGE_TREND_MAX_CANDLE_LAG_SEC", "7200")
+)
+DOGE_TREND_SLIPPAGE_BPS = float(os.environ.get("DOGE_TREND_SLIPPAGE_BPS", "10"))
 # true: 按各币对近期波动率（ATR%）动态分配总预算——网格赚波动的钱，
 #       波动越大分越多；ALLOC_MIN/MAX_W 限制单币对占比，防极端。
 # false: 三币对均分。
@@ -194,6 +211,11 @@ def validate() -> None:
     assert PREDICTIVE_MAX_CANDLE_LAG_SEC >= 3600, "预测策略 K 线最大滞后至少为 1 小时"
     assert 1 <= PREDICTIVE_MAX_POSITIONS <= len(PREDICTIVE_PAIRS), "预测策略持仓数非法"
     assert PREDICTIVE_SLIPPAGE_BPS >= 0, "预测策略滑点不能为负"
+    assert DOGE_TREND_HISTORY_DAYS >= 7, "DOGE 趋势策略历史窗口至少为 7 天"
+    assert DOGE_TREND_KLINE_REFRESH_SEC >= 30, "DOGE 趋势策略 K 线刷新不得过于频繁"
+    assert DOGE_TREND_INIT_RETRY_SEC >= 3, "DOGE 趋势策略初始化重试间隔至少为 3 秒"
+    assert DOGE_TREND_MAX_CANDLE_LAG_SEC >= 3600, "DOGE 趋势策略 K 线最大滞后至少为 1 小时"
+    assert DOGE_TREND_SLIPPAGE_BPS >= 0, "DOGE 趋势策略滑点不能为负"
     assert 0 < ALLOC_MIN_W < ALLOC_MAX_W <= 1, "ALLOC_MIN_W/MAX_W 区间非法"
     assert PAPER_FEE_RATE >= 0, "PAPER_FEE_RATE 不能为负"
     assert RANGE_PCT_MIN < RANGE_PCT_MAX, "RANGE_PCT_MIN 必须小于 MAX"

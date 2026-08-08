@@ -61,6 +61,7 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 | `aggressive` 激进轮动 | 无信号过滤双向硬跑 + 自适应区间 + 换币 |
 | `hunter` 猎手精选 | 启动即全市场筛选 Top3 建仓，无信号过滤激进风格 |
 | `predictive` 预测轮动（研究） | 独立 paper-only：1h K 线滚动 Ridge、纯 USDT 起步、long/flat、每日决策 |
+| `doge_trend` DOGE 趋势恢复（研究） | 独立 paper-only：DOGE 单币、RSI 超卖 50% 试探、EMA 恢复确认后才加至满仓 |
 
 策略定义在 `trading/profiles.py`，可自行增删改。
 
@@ -70,6 +71,11 @@ BTC 168h EMA 风控、最多三币等权。模拟盘默认采用每侧 **10 bps*
 K 线缓存保存于 `trading/data/predictive_1h_cache.json`：服务先立即启动 Web，再在后台读取缓存并
 补齐最新 K 线；首次无缓存时也不会阻塞其他策略。完成预热后，它会显示为就绪，点击该 Tab 的开始
 按钮才产生前向模拟交易。
+
+`doge_trend` 只交易 `DOGE_USDT`，单独使用 `trading/data/trading_doge_trend.db` 与
+`trading/data/doge_trend_1h_cache.json`，并同样代码级禁止 live 模式。回测以“下一根开盘”作为
+可复现代理；模拟盘则在新的已收盘 1h K 线出现后按当前 ticker 加每侧 10 bps 保守滑点成交，成交事件会
+写入信号 K 线、ticker 观察时间与价格来源。服务重启期间不会追补历史交易，避免把离线行情伪造成前向收益。
 
 - 网格参数（区间幅度、层数）在 `trading/config.py` 中调整；
 - **启动流程**：服务启动后只做环境初始化，处于待命状态，需在面板点击 **开始** 才正式交易：
@@ -153,6 +159,19 @@ K 线缓存保存于 `trading/data/predictive_1h_cache.json`：服务先立即�
 样本外验证，才值得用完全相同的特征/标签/执行时序增加 XGBoost 或时序模型作增量比较。不得
 根据单一总收益选择参数：至少检查每 30 天分段收益、最大回撤、换手和滑点后的结果。该模块尚未
 连接 `Engine`，更不应据此开启实盘。
+
+### DOGE 单币趋势恢复候选（研究）
+
+`trading.doge_trend` 是独立的 DOGE long/flat 策略：RSI 超卖时先以 50% 仓位试探，只有
+短 EMA 恢复趋势且价格高于成本才加至满仓，并以 5% 止盈、5% 止损和 72 小时最长持仓退出；
+硬止损后必须先看到 RSI 回升至阈值上方才会重新允许下一次超卖试探。
+回测默认按每侧 10 bps 不利滑点执行；完整口径、成本压力和时间切分结果见
+[DOGE 策略研究记录](docs/DOGE_TREND_RESEARCH.md)。它已接入独立模拟盘 Tab，仍未接入实盘。
+
+```bash
+.venv/bin/python -m trading.doge_trend --days 150 \
+  --cache trading/data/predictive_1h_cache.json
+```
 
 已完成的探索结果、被否决的配置及实盘前门槛见 [docs/STRATEGY_RESEARCH.md](docs/STRATEGY_RESEARCH.md)。
 

@@ -53,6 +53,7 @@ def main() -> None:
     log = logging.getLogger("run")
 
     from trading.engine import Engine  # 延迟导入，先配好日志
+    from trading.doge_trend_engine import DogeTrendPaperEngine
     from trading.predictive_engine import PredictivePaperEngine
     from trading.profiles import enabled_profiles
 
@@ -68,8 +69,12 @@ def main() -> None:
     engines = {}
     for name, profile in profiles.items():
         try:
-            engine = (PredictivePaperEngine(profile)
-                      if profile.kind == "predictive" else Engine(profile))
+            if profile.kind == "predictive":
+                engine = PredictivePaperEngine(profile)
+            elif profile.kind == "doge_trend":
+                engine = DogeTrendPaperEngine(profile)
+            else:
+                engine = Engine(profile)
         except Exception:
             # 初始化阶段的异常（网络、密钥、行情获取失败等）也必须留下记录
             log.critical("引擎初始化失败: %s", name, exc_info=True)

@@ -19,7 +19,7 @@ class Profile:
     name: str
     label: str
     pairs: tuple[str, ...]
-    kind: str = "grid"             # grid | predictive；predictive 仅支持模拟盘
+    kind: str = "grid"             # grid | predictive | doge_trend；后两者仅支持模拟盘
     use_signal_filter: bool = True   # 指标信号过滤
     adaptive_range: bool = True      # ATR 自适应区间
     dynamic_allocation: bool = True  # 波动率动态分配 + 定期再平衡
@@ -68,6 +68,13 @@ PROFILES: dict[str, Profile] = {
     "predictive": Profile(
         name="predictive", label="预测轮动（研究）",
         pairs=config.PREDICTIVE_PAIRS, kind="predictive",
+        use_signal_filter=False, adaptive_range=False,
+        dynamic_allocation=False, slot_rotation=False,
+    ),
+    # DOGE 单币研究候选：RSI 超卖半仓试探，EMA 恢复且高于成本后才加至满仓。
+    "doge_trend": Profile(
+        name="doge_trend", label="DOGE 趋势恢复（研究）",
+        pairs=("DOGE_USDT",), kind="doge_trend",
         use_signal_filter=False, adaptive_range=False,
         dynamic_allocation=False, slot_rotation=False,
     ),
