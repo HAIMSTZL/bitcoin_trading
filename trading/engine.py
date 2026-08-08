@@ -311,6 +311,9 @@ class Engine:
         self._tick_lock = threading.Lock()
         # 模拟盘重置注入的预算（None = 用 config.TOTAL_QUOTE_BUDGET）
         self._budget_override: Optional[float] = None
+        # 恢复/重启交易后的首个 tick：暂停期间缓存必然过期，用预热预算等行情，
+        # 避免冷缓存窗口刷一串"ticker 无可用价格"的 tick 错误
+        self._warm_next_tick = False
         self._snapshot_counter = 0
         self._last_snapshot = 0.0  # 权益快照按时间驱动（每30秒），而非 tick 计数
         self._last_health = 0.0  # 首次 tick 即报一条健康状态，之后按间隔
@@ -713,7 +716,11 @@ class Engine:
             self._tick_body()
 
     def _tick_body(self) -> None:
-        self.prices = self._fetch_prices()
+        if self._warm_next_tick:
+            self._warm_next_tick = False
+            self.prices = self._fetch_prices(initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC)
+        else:
+            self.prices = self._fetch_prices()
         self._check_circuit_breaker()  # 熔断检测永远运行（含熔断期间，用于企稳恢复）
         self._update_indicators()
         if not self._cb_global:
@@ -1170,6 +1177,7 @@ class Engine:
         if self._stopped:
             return "stopped"
         self._paused.clear()
+        self._warm_next_tick = True  # 暂停期间缓存已过期，首个 tick 走预热等待
         log.info("引擎已恢复运行")
         self._event("INFO", "control", "用户恢复交易引擎")
         return self.run_status
@@ -1192,6 +1200,7 @@ class Engine:
             self._stop.clear()
             self._paused.clear()
             self._stopped = False
+            self._warm_next_tick = True  # 停止期间缓存已过期，首个 tick 走预热等待
             self.start_background()
             log.info("引擎已重新启动")
             self._event("INFO", "control", "用户重新启动交易引擎")

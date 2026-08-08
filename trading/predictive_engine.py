@@ -109,6 +109,8 @@ class PredictivePaperEngine:
         self._thread: threading.Thread | None = None
         # tick 与仓位重置互斥：防止重置与进行中的调仓决策并发修改账户
         self._tick_lock = threading.Lock()
+        # 恢复/重启交易后的首个 tick：暂停期间缓存必然过期，用预热预算等行情
+        self._warm_next_tick = False
 
         self._restore_or_seed()
         self._load_cached_history()
@@ -521,7 +523,12 @@ class PredictivePaperEngine:
     def tick(self) -> None:
         # 先确认已收盘 K 线，再读取成交用 ticker，避免使用刷新历史之前的旧报价。
         self._refresh_history()
-        self.prices = _fetch_tickers_cached(None, self.pairs)
+        if self._warm_next_tick:
+            self._warm_next_tick = False
+            self.prices = _fetch_tickers_cached(
+                None, self.pairs, initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC)
+        else:
+            self.prices = _fetch_tickers_cached(None, self.pairs)
         self._price_observed_at = time.time()
         missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
         if missing:
@@ -646,6 +653,7 @@ class PredictivePaperEngine:
         if self._stopped:
             return "stopped"
         self._paused.clear()
+        self._warm_next_tick = True  # 暂停期间缓存已过期，首个 tick 走预热等待
         self._event("INFO", "control", "用户开始/恢复预测模拟策略")
         return self.run_status
 
@@ -654,6 +662,7 @@ class PredictivePaperEngine:
             self._stop.clear()
             self._paused.clear()
             self._stopped = False
+            self._warm_next_tick = True  # 停止期间缓存已过期，首个 tick 走预热等待
             self.start_background()
             self._event("INFO", "control", "用户重新启动预测模拟策略")
             return self.run_status
