@@ -60,8 +60,8 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 | `rotation` 筛选轮换 | 完整版：信号过滤 + 自适应区间 + 动态分配 + 空仓换币 |
 | `aggressive` 激进轮动 | 无信号过滤双向硬跑 + 自适应区间 + 换币 |
 | `hunter` 猎手精选 | 启动即全市场筛选 Top3 建仓，无信号过滤激进风格 |
-| `predictive` 预测轮动（研究） | 独立 paper-only：1h K 线滚动 Ridge、纯 USDT 起步、long/flat、每日决策 |
-| `doge_trend` DOGE 趋势恢复（研究） | 独立 paper-only：DOGE 单币、RSI 超卖 50% 试探、EMA 恢复确认后才加至满仓 |
+| `predictive` 先知轮动 | 独立 paper-only：1h K 线滚动 Ridge、纯 USDT 起步、long/flat、每日决策 |
+| `doge_trend` DOGE 低吸先锋 | 独立 paper-only：DOGE 单币、RSI 超卖 50% 试探、EMA 恢复确认后才加至满仓 |
 
 策略定义在 `trading/profiles.py`，可自行增删改。
 

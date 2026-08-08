@@ -66,14 +66,14 @@ PROFILES: dict[str, Profile] = {
     ),
     # 预测候选：不是网格，纯 USDT 起步、long/flat、多币种等权；由独立 paper 引擎执行。
     "predictive": Profile(
-        name="predictive", label="预测轮动（研究）",
+        name="predictive", label="先知轮动",
         pairs=config.PREDICTIVE_PAIRS, kind="predictive",
         use_signal_filter=False, adaptive_range=False,
         dynamic_allocation=False, slot_rotation=False,
     ),
     # DOGE 单币研究候选：RSI 超卖半仓试探，EMA 恢复且高于成本后才加至满仓。
     "doge_trend": Profile(
-        name="doge_trend", label="DOGE 趋势恢复（研究）",
+        name="doge_trend", label="DOGE 低吸先锋",
         pairs=("DOGE_USDT",), kind="doge_trend",
         use_signal_filter=False, adaptive_range=False,
         dynamic_allocation=False, slot_rotation=False,
