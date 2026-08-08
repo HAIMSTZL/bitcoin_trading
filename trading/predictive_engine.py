@@ -21,7 +21,7 @@ from gate_api import GatePublicClient
 
 from . import config
 from .backtest import Candle, fetch_gate_candles
-from .engine import _fetch_tickers_cached
+from .engine import _TICKER_BOOTSTRAP_WAIT_SEC, _fetch_tickers_cached
 from .predictive import (
     PredictiveSettings,
     _WARMUP_BARS,
@@ -315,7 +315,9 @@ class PredictivePaperEngine:
             self._load_initial_history()
         # 这是后台预热而不是 tick：给四并发行情请求足够时间完成两三批，避免
         # 网络正常但 RTT 略高于运行时 1 秒预算时反复预热失败。不会占用 ticker 锁。
-        self.prices = _fetch_tickers_cached(None, self.pairs, initial_wait_sec=8.0)
+        self.prices = _fetch_tickers_cached(
+            None, self.pairs, initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC,
+        )
         missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
         if missing:
             raise RuntimeError(f"未获取到预测币池行情: {', '.join(missing)}")

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 import traceback
@@ -30,30 +31,31 @@ log = logging.getLogger("trading.engine")
 # 多策略引擎共享的按币对行情缓存。Gate 的全市场 ticker 响应较大，不能每个
 # tick 下载全部交易对；这里仅请求策略实际需要的币池，并防止多策略重复拉取同一币。
 _TICKER_CACHE: dict = {"data": {}, "updated": {}, "failures": {}, "inflight": {}}
-_TICKER_TTL = 2.0
+# 刷新周期至少覆盖一个 tick：请求完成后，下一个 tick 通常直接复用缓存，避免每轮
+# 都请求全币池；异步刷新期间仍可用上一帧报价撮合。
+_TICKER_TTL = max(3.0, config.TICK_INTERVAL)
 _TICKER_LOCK = threading.Lock()
-_TICKER_THREAD_LOCAL = threading.local()
 # ticker 是可很快再次获取的非关键读；不能让单次网络抖动占满并发槽 80 秒。
 # 与会下单/读账户的客户端分开，使用短超时、一次重试的刷新预算。
-_TICKER_REFRESH_SLOTS = threading.BoundedSemaphore(4)
+_TICKER_WORKER_COUNT = 4
 _TICKER_REQUEST_TIMEOUT_SEC = 5.0
 _TICKER_REQUEST_RETRIES = 1
 _TICKER_INITIAL_WAIT_SEC = 1.0
+_TICKER_BOOTSTRAP_WAIT_SEC = 8.0
 _TICKER_MAX_STALE_SEC = 30.0
 _TICKER_FAILURE_LIMIT = 3
 _TICKER_SLOW_REFRESH_SEC = 5.0
+_TICKER_TASKS: queue.Queue = queue.Queue()
+_TICKER_WORKERS: list[threading.Thread] = []
+_TICKER_WORKERS_LOCK = threading.Lock()
 
 
-def _thread_ticker_spot() -> SpotAPI:
-    """每个后台刷新线程使用独立 Session，避免跨线程共享 requests.Session。"""
-    spot = getattr(_TICKER_THREAD_LOCAL, "spot", None)
-    if spot is None:
-        spot = SpotAPI(GatePublicClient(
-            timeout=_TICKER_REQUEST_TIMEOUT_SEC,
-            retries=_TICKER_REQUEST_RETRIES,
-        ))
-        _TICKER_THREAD_LOCAL.spot = spot
-    return spot
+def _new_ticker_spot() -> SpotAPI:
+    """为一个长寿命行情 worker 创建独立、可复用连接的公开客户端。"""
+    return SpotAPI(GatePublicClient(
+        timeout=_TICKER_REQUEST_TIMEOUT_SEC,
+        retries=_TICKER_REQUEST_RETRIES,
+    ))
 
 
 def _parse_ticker_price(pair: str, rows) -> float:
@@ -68,13 +70,11 @@ def _parse_ticker_price(pair: str, rows) -> float:
         raise RuntimeError(f"ticker 响应无有效价格: {pair}") from error
 
 
-def _refresh_ticker_pair(pair: str, spot: SpotAPI | None, done: threading.Event) -> None:
+def _refresh_ticker_pair(pair: str, spot: SpotAPI, done: threading.Event) -> None:
     """后台刷新一个币对；网络 I/O 永远不占用 ``_TICKER_LOCK``。"""
     started = time.monotonic()
     try:
-        # 限制总并发连接数，避免十币池启动时形成请求尖峰。
-        with _TICKER_REFRESH_SLOTS:
-            rows = (spot or _thread_ticker_spot()).list_tickers(pair)
+        rows = spot.list_tickers(pair)
         price = _parse_ticker_price(pair, rows)
     except Exception as error:
         with _TICKER_LOCK:
@@ -100,6 +100,54 @@ def _refresh_ticker_pair(pair: str, spot: SpotAPI | None, done: threading.Event)
         done.set()
 
 
+def _ticker_worker(worker_number: int) -> None:
+    """长寿命 worker：串行消费任务，并复用本线程的 HTTP Session/TLS 连接。"""
+    worker_spot = _new_ticker_spot()
+    while True:
+        pair, requested_spot, done = _TICKER_TASKS.get()
+        try:
+            # 显式 spot 仅用于测试；生产任务统一使用该 worker 的连接池。
+            _refresh_ticker_pair(pair, requested_spot or worker_spot, done)
+        except Exception:
+            # _refresh_ticker_pair 已自行记录普通网络错误。此处仅防御不可预期的
+            # worker 异常，保证任务事件不会永久卡住。
+            log.exception("ticker worker %d 执行任务时发生未处理异常: %s", worker_number, pair)
+            with _TICKER_LOCK:
+                _TICKER_CACHE.setdefault("inflight", {}).pop(pair, None)
+            done.set()
+        finally:
+            _TICKER_TASKS.task_done()
+
+
+def _ensure_ticker_workers() -> None:
+    """按需启动固定数量的长寿命 worker；不在 ticker 缓存锁内执行。"""
+    with _TICKER_WORKERS_LOCK:
+        _TICKER_WORKERS[:] = [worker for worker in _TICKER_WORKERS if worker.is_alive()]
+        while len(_TICKER_WORKERS) < _TICKER_WORKER_COUNT:
+            worker_number = len(_TICKER_WORKERS) + 1
+            worker = threading.Thread(
+                target=_ticker_worker, args=(worker_number,), daemon=True,
+                name=f"ticker-worker-{worker_number}",
+            )
+            worker.start()
+            _TICKER_WORKERS.append(worker)
+
+
+def _enqueue_ticker_refresh(pair: str, spot: SpotAPI | None, done: threading.Event) -> None:
+    """投递刷新任务；worker 池本身限制所有生产网络并发为四。"""
+    _ensure_ticker_workers()
+    _TICKER_TASKS.put_nowait((pair, spot, done))
+
+
+def _clear_inflight(pair: str, done: threading.Event) -> None:
+    """投递失败时回滚登记，避免一个永不触发的 Event 永久阻塞该币对。"""
+    with _TICKER_LOCK:
+        inflight = _TICKER_CACHE.setdefault("inflight", {})
+        if inflight.get(pair) is done:
+            inflight.pop(pair, None)
+    done.set()
+
+
 def _schedule_ticker_refresh(pair: str, spot: SpotAPI | None) -> tuple[float | None, threading.Event | None]:
     """锁内只检查/登记缓存；真正的请求由后台线程在锁外完成。"""
     now = time.time()
@@ -116,11 +164,11 @@ def _schedule_ticker_refresh(pair: str, spot: SpotAPI | None) -> tuple[float | N
             return current, done
         done = threading.Event()
         inflight[pair] = done
-    thread = threading.Thread(
-        target=_refresh_ticker_pair, args=(pair, spot, done), daemon=True,
-        name=f"ticker-refresh-{pair}",
-    )
-    thread.start()
+    try:
+        _enqueue_ticker_refresh(pair, spot, done)
+    except Exception:
+        _clear_inflight(pair, done)
+        raise
     return current, done
 
 
@@ -298,14 +346,18 @@ class Engine:
         self._paused.set()
 
     # ------------------------------------------------------------------
-    def _fetch_prices(self) -> dict[str, float]:
+    def _fetch_prices(
+        self, *, initial_wait_sec: float = _TICKER_INITIAL_WAIT_SEC,
+    ) -> dict[str, float]:
         """按币对分别查询 ticker（响应小、抗超时；全市场单次拉取响应数 MB 易超时）。
 
         BTC 作为大盘熔断基准，无论是否在交易序列中都必须拉取（P1 修复：
         补位换币可能把 BTC 换出序列，不能让大盘熔断失明）。
         多引擎共享 _TICKER_CACHE，同一批行情供所有策略。
         """
-        return _fetch_tickers_cached(None, set(self.pairs) | {"BTC_USDT"})
+        return _fetch_tickers_cached(
+            None, set(self.pairs) | {"BTC_USDT"}, initial_wait_sec=initial_wait_sec,
+        )
 
     def _initialize(self) -> None:
         """在引擎线程中完成首次建仓，失败可安全重试。
@@ -352,7 +404,7 @@ class Engine:
             saved = self.store.load_bot_states()
             if saved:
                 self.pairs = list(saved.keys())  # 运行时币对 = 存档币对
-                self.prices = self._fetch_prices()
+                self.prices = self._fetch_prices(initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC)
                 sig_now = self._config_sig()
                 for pair in self.pairs:
                     d = saved[pair]
@@ -413,7 +465,7 @@ class Engine:
                 self._event("INFO", "screen_none",
                             "启动筛选无合格候选，使用默认币对建仓")
 
-        self.prices = self._fetch_prices()
+        self.prices = self._fetch_prices(initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC)
         budgets = self._initial_budgets()
         for pair in self.pairs:
             price = self.prices.get(pair)

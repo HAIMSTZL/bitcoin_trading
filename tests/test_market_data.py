@@ -4,6 +4,9 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
+from trading import config
 from gate_api import GatePublicClient
 from trading import engine as engine_module
 from trading.grid import PaperAccount
@@ -63,6 +66,7 @@ def test_ticker_cache_scopes_requests_to_pairs_and_reuses_each_price(monkeypatch
     }
     assert engine_module._fetch_tickers_cached(spot, ("AAA_USDT",)) == {"AAA_USDT": 1.5}
     assert spot.calls == ["AAA_USDT", "BBB_USDT"]
+    assert engine_module._TICKER_TTL >= config.TICK_INTERVAL
 
 
 def test_slow_pair_refresh_does_not_hold_cache_lock(monkeypatch):
@@ -125,6 +129,21 @@ def test_background_bootstrap_can_opt_into_longer_initial_wait(monkeypatch):
     assert engine_module._fetch_tickers_cached(
         DelayedSpot(), ("AAA_USDT",), initial_wait_sec=0.2,
     ) == {"AAA_USDT": 1.5}
+
+
+def test_enqueue_failure_clears_inflight_event(monkeypatch):
+    """worker 创建/投递失败不能把币对永久锁死在 inflight。"""
+    monkeypatch.setattr(engine_module, "_TICKER_CACHE", {
+        "data": {}, "updated": {}, "failures": {}, "inflight": {},
+    })
+    monkeypatch.setattr(
+        engine_module, "_enqueue_ticker_refresh",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("worker unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="worker unavailable"):
+        engine_module._schedule_ticker_refresh("AAA_USDT", None)
+    assert engine_module._TICKER_CACHE["inflight"] == {}
 
 
 def test_grid_engine_initialization_can_complete_after_web_is_available():

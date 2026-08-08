@@ -331,8 +331,11 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 
 ### 6.1 模拟盘
 
-- 挂单静置于固定价位；每 tick 用 Gate **真实最新成交价**判断：
+- 挂单静置于固定价位；每 tick 用 Gate ticker 的**最近可用缓存报价**判断：
   价格 ≤ 买单价 → 买成交；价格 ≥ 卖单价 → 卖成交；
+- ticker 在独立 worker 中异步刷新以避免网络阻塞策略循环，因此某次撮合通常使用
+  最近一到两个轮询周期内（约 3–6 秒）取得的报价，而不是交易所逐笔成交流中的瞬时价格；
+  这是模拟盘的明确口径，复盘时应以事件中的报价为准；
 - 假设全额成交、无滑点；**手续费按 `PAPER_FEE_RATE`（默认 0.1% 单边）扣除**，
   已实现利润为扣费后净利，并与持仓移动平均成本（avg_cost）账实一致；
 - 轮询粒度 3 秒，瞬间触及又拉回的价格可能漏接。
@@ -429,4 +432,3 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 ---
 
 *文档版本与代码同步维护，参数调整后请更新第 5 节。*
-
