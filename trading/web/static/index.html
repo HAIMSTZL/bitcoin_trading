@@ -671,7 +671,8 @@ function ingest(s) {
   const t = s.last_tick || Date.now() / 1000;
   for (const [pair, d] of Object.entries(s.pairs)) {
     const key = strat + ':' + pair;
-    if (!(key in priceFirst)) priceFirst[key] = d.price;
+    // 预热阶段后端会推 price=0，不能拿 0 当涨跌幅基准（否则除以 0 显示 +∞）
+    if (!(key in priceFirst) && d.price > 0) priceFirst[key] = d.price;
     const h = priceHist[key] || (priceHist[key] = []);
     if (d.price && (!h.length || h[h.length - 1].v !== d.price)) {
       h.push({ t, v: d.price });
@@ -684,6 +685,13 @@ function ingest(s) {
     eqHist.push({ ts: t, equity: s.total_equity, realized: s.total_realized_profit });
     if (eqHist.length > HIST_MAX) eqHist.shift();
   }
+}
+
+/* 相对首个有效报价的涨跌幅；预热期（基准缺失或为 0）返回 null，前端显示 -- */
+function chgPct(strat, pair, price) {
+  const base = priceFirst[strat + ':' + pair];
+  if (!base || !isFinite(base) || !price) return null;
+  return (price - base) / base * 100;
 }
 
 function render(s) {
@@ -716,8 +724,9 @@ function render(s) {
 
   /* 行情条 */
   const tick = Object.values(s.pairs).map(d => {
-    const chg = (d.price - priceFirst[strat + ':' + d.pair]) / priceFirst[strat + ':' + d.pair] * 100;
-    return `${d.pair.replace('_', '/')} <b class="mono-num">${fmtPrice(d.price)}</b> <span class="${signCls(chg)}">${chg >= 0 ? '▲' : '▼'}${fmt(Math.abs(chg), 2)}%</span>`;
+    const chg = chgPct(strat, d.pair, d.price);
+    const chgTxt = chg === null ? '--' : `${chg >= 0 ? '▲' : '▼'}${fmt(Math.abs(chg), 2)}%`;
+    return `${d.pair.replace('_', '/')} <b class="mono-num">${fmtPrice(d.price)}</b> <span class="${signCls(chg || 0)}">${chgTxt}</span>`;
   }).join('&nbsp;&nbsp;·&nbsp;&nbsp;');
   $('ticker').innerHTML = `<span class="lbl">LIVE FEED</span>&nbsp;&nbsp;${tick}` +
     `&nbsp;&nbsp;·&nbsp;&nbsp;权益 <b>${fmt(s.total_equity, 2)}U</b>&nbsp;&nbsp;·&nbsp;&nbsp;已实现 <b>${fmt(s.total_realized_profit, 4)}</b>` +
@@ -741,11 +750,12 @@ function render(s) {
 
   /* 价格监控 */
   $('priceRows').innerHTML = Object.values(s.pairs).map(d => {
-    const chg = (d.price - priceFirst[strat + ':' + d.pair]) / priceFirst[strat + ':' + d.pair] * 100;
+    const chg = chgPct(strat, d.pair, d.price);
+    const chgTxt = chg === null ? '--' : `${chg >= 0 ? '+' : ''}${fmt(chg, 2)}%`;
     return `<div class="price-row">
       <span class="sym">${d.pair.replace('_', '/')}</span>
       <span class="val mono-num">${fmtPrice(d.price)}</span>
-      <span class="chg mono-num ${signCls(chg)}">${chg >= 0 ? '+' : ''}${fmt(chg, 2)}%</span>
+      <span class="chg mono-num ${signCls(chg || 0)}">${chgTxt}</span>
       <canvas id="spark-${d.pair}"></canvas></div>`;
   }).join('');
   Object.values(s.pairs).forEach(d => {
