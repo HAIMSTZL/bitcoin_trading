@@ -27,43 +27,49 @@ from .store import Store
 
 log = logging.getLogger("trading.engine")
 
-# 多策略引擎共享的行情缓存：同一批 tick 喂给所有引擎，
-# 既保证 A/B 对照看到同一时间戳的价格，也减少重复请求。
-_TICKER_CACHE: dict = {"ts": 0.0, "data": {}}
+# 多策略引擎共享的按币对行情缓存。Gate 的全市场 ticker 响应较大，不能每个
+# tick 下载全部交易对；这里仅请求策略实际需要的币池，并防止多策略重复拉取同一币。
+_TICKER_CACHE: dict = {"data": {}, "updated": {}}
 _TICKER_TTL = 2.0
 _TICKER_LOCK = threading.Lock()
 _PUBLIC_TICKER_SPOT = SpotAPI(GatePublicClient(timeout=20.0, retries=3))
 
 
 def _fetch_tickers_cached(spot: SpotAPI | None, pairs) -> dict[str, float]:
-    """从一次全市场 ticker 响应中取所需币对，并跨引擎去重。
+    """按实际币池读取小型 ticker 响应，并跨策略做逐币对缓存。
 
-    原实现按币对逐个请求；预测策略的十币池会把高频行情请求放大到每秒数次。
-    Gate 支持不传 ``currency_pair`` 的批量 ticker。本函数默认使用一个无 Key 的
-    ``GatePublicClient``，并由互斥锁保护，使同一轮多策略 tick 最多触发一次 HTTP 请求。
-    ``spot`` 仅为单元测试或显式注入保留；生产引擎应传 ``None``。
+    Gate 的 ``/spot/tickers`` 仅支持单个 ``currency_pair`` 或全市场响应，并不支持
+    多币对参数。全市场响应在本地实测约 0.5MB，若按 3 秒轮询会产生不必要的大流量
+    和 ReadTimeout 风险。因此每个失效币对只发一个小请求；互斥锁保证不同策略在
+    同一 TTL 内不会重复请求同一币对。``spot`` 仅供测试/显式注入，生产传 ``None``。
     """
     requested = tuple(sorted(set(pairs)))
     with _TICKER_LOCK:
         now = time.time()
         cache = _TICKER_CACHE
-        if now - cache["ts"] < _TICKER_TTL and all(p in cache["data"] for p in requested):
-            return {p: cache["data"][p] for p in requested}
-        rows = (spot or _PUBLIC_TICKER_SPOT).list_tickers()
-        data = {}
-        for row in rows or []:
-            pair = row.get("currency_pair")
-            if pair in requested:
-                try:
-                    data[pair] = float(row["last"])
-                except (KeyError, TypeError, ValueError):
-                    continue
+        data = cache.setdefault("data", {})
+        updated = cache.setdefault("updated", {})
+        source = spot or _PUBLIC_TICKER_SPOT
+        stale = [
+            pair for pair in requested
+            if pair not in data or now - float(updated.get(pair, 0.0)) >= _TICKER_TTL
+        ]
+        for pair in stale:
+            rows = source.list_tickers(pair)
+            if not rows:
+                raise RuntimeError(f"ticker 响应为空: {pair}")
+            try:
+                row = rows[0]
+                if row.get("currency_pair") not in (None, pair):
+                    raise RuntimeError(f"ticker 响应币对不匹配: 期望 {pair}")
+                data[pair] = float(row["last"])
+                updated[pair] = time.time()
+            except (AttributeError, KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(f"ticker 响应无有效价格: {pair}") from error
         missing = [pair for pair in requested if pair not in data]
         if missing:
             raise RuntimeError(f"ticker 响应缺少币对: {', '.join(missing)}")
-        cache["data"].update(data)
-        cache["ts"] = time.time()
-        return {p: cache["data"][p] for p in requested}
+        return {p: data[p] for p in requested}
 
 
 class LiveExecutor:

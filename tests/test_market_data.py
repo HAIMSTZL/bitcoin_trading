@@ -39,24 +39,22 @@ def test_public_client_retries_transient_status(monkeypatch):
     assert session.calls == 2
 
 
-def test_ticker_cache_batches_all_pairs_and_reuses_response(monkeypatch):
+def test_ticker_cache_scopes_requests_to_pairs_and_reuses_each_price(monkeypatch):
     class Spot:
         def __init__(self):
             self.calls = []
 
         def list_tickers(self, pair=None):
             self.calls.append(pair)
-            return [
-                {"currency_pair": "AAA_USDT", "last": "1.5"},
-                {"currency_pair": "BBB_USDT", "last": "2.5"},
-            ]
+            values = {"AAA_USDT": "1.5", "BBB_USDT": "2.5"}
+            return [{"currency_pair": pair, "last": values[pair]}]
 
     spot = Spot()
-    monkeypatch.setattr(engine_module, "_TICKER_CACHE", {"ts": 0.0, "data": {}})
+    monkeypatch.setattr(engine_module, "_TICKER_CACHE", {"data": {}, "updated": {}})
     monkeypatch.setattr(engine_module.time, "time", lambda: 100.0)
 
     assert engine_module._fetch_tickers_cached(spot, ("AAA_USDT", "BBB_USDT")) == {
         "AAA_USDT": 1.5, "BBB_USDT": 2.5,
     }
     assert engine_module._fetch_tickers_cached(spot, ("AAA_USDT",)) == {"AAA_USDT": 1.5}
-    assert spot.calls == [None]
+    assert spot.calls == ["AAA_USDT", "BBB_USDT"]
