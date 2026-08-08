@@ -307,6 +307,10 @@ class Engine:
         self._paused = threading.Event()
         self._stopped = False
         self._thread: Optional[threading.Thread] = None
+        # tick 与仓位重置互斥：防止重置清空存档后，进行中的 tick 又把旧状态落盘
+        self._tick_lock = threading.Lock()
+        # 模拟盘重置注入的预算（None = 用 config.TOTAL_QUOTE_BUDGET）
+        self._budget_override: Optional[float] = None
         self._snapshot_counter = 0
         self._last_snapshot = 0.0  # 权益快照按时间驱动（每30秒），而非 tick 计数
         self._last_health = 0.0  # 首次 tick 即报一条健康状态，之后按间隔
@@ -594,7 +598,8 @@ class Engine:
         ALLOC_MIN_W/MAX_W 限制单币对占比。失败时回退均分。
         """
         n = len(self.pairs)
-        total = config.TOTAL_QUOTE_BUDGET
+        total = (self._budget_override if self._budget_override is not None
+                 else config.TOTAL_QUOTE_BUDGET)
         if not self.profile.dynamic_allocation:
             return {p: total / n for p in self.pairs}
         try:
@@ -703,6 +708,11 @@ class Engine:
                             pair=fill["pair"], detail={"fill": fill})
 
     def tick(self) -> None:
+        # 与 reset_paper 互斥：重置清空存档期间，进行中的 tick 不得再把旧状态落盘
+        with self._tick_lock:
+            self._tick_body()
+
+    def _tick_body(self) -> None:
         self.prices = self._fetch_prices()
         self._check_circuit_breaker()  # 熔断检测永远运行（含熔断期间，用于企稳恢复）
         self._update_indicators()
@@ -1166,7 +1176,8 @@ class Engine:
 
     def shutdown(self) -> str:
         """停止交易循环（不关闭存储，Web 服务退出时由 stop() 统一收尾）。"""
-        self._save_bot_states()  # 停前落盘，保证模拟盘可无损续跑
+        with self._tick_lock:  # 与 reset_paper 互斥，避免重置后又把旧状态落盘
+            self._save_bot_states()  # 停前落盘，保证模拟盘可无损续跑
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
@@ -1186,6 +1197,39 @@ class Engine:
             self._event("INFO", "control", "用户重新启动交易引擎")
             return self.run_status
         return self.resume()
+
+    def reset_paper(self, budget: float) -> str:
+        """模拟盘仓位重置：清空该策略的持仓/挂单/成交与权益历史，按给定 USDT 重新建仓。
+
+        仅清空本策略数据库中的账户状态（事件日志保留，供审计复盘）；重置后引擎
+        回到待命状态，需在面板点击"开始"才正式交易。实盘一律拒绝。
+        """
+        if self.mode == "live":
+            raise RuntimeError("实盘模式禁止通过 Web 重置账户")
+        if not isinstance(budget, (int, float)) or isinstance(budget, bool):
+            raise ValueError("重置金额必须是数字")
+        if not (0 < float(budget) <= 1_000_000):
+            raise ValueError("重置金额必须在 (0, 1000000] USDT 之间")
+        budget = float(budget)
+        self._paused.set()  # 先阻断新的 tick
+        with self._tick_lock:  # 等待进行中的 tick 完成，避免旧状态被重新落盘
+            self.store.clear_bot_states()
+            self.store.clear_trades()
+            self.store.clear_equity_snapshots()
+            self.store.delete_meta("initial_equity")
+            self._budget_override = budget
+            self._initial_total = 0.0
+            self._initial_equity_persisted = False
+            self._ready.clear()
+            self._initializing = True
+            self._init_error = None
+            self._next_init_attempt = 0.0  # 引擎线程下一轮循环立即重新建仓
+        log.warning("模拟盘仓位已重置: %.2f USDT", budget)
+        self._event("WARNING", "paper_reset",
+                    f"模拟盘仓位已重置为 {budget:.2f} USDT，持仓/挂单/成交记录已清空，"
+                    f"重新建仓后等待开始指令",
+                    detail={"budget": budget})
+        return self.run_status
 
     @property
     def run_status(self) -> str:

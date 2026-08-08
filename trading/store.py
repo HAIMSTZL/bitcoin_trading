@@ -124,6 +124,18 @@ class Store:
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM bot_state")
 
+    def clear_trades(self) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM trades")
+
+    def clear_equity_snapshots(self) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM equity_snapshots")
+
+    def delete_meta(self, key: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM meta WHERE k=?", (key,))
+
     def record_trade(
         self,
         mode: str,

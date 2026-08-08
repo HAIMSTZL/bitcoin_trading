@@ -107,6 +107,8 @@ class PredictivePaperEngine:
         self._paused = threading.Event()
         self._stopped = False
         self._thread: threading.Thread | None = None
+        # tick 与仓位重置互斥：防止重置与进行中的调仓决策并发修改账户
+        self._tick_lock = threading.Lock()
 
         self._restore_or_seed()
         self._load_cached_history()
@@ -576,7 +578,8 @@ class PredictivePaperEngine:
                 self._stop.wait(config.TICK_INTERVAL)
                 continue
             try:
-                self.tick()
+                with self._tick_lock:  # 与 reset_paper 互斥
+                    self.tick()
                 self.last_error = None
                 self._last_success = time.time()
                 if self._api_outage:
@@ -604,6 +607,41 @@ class PredictivePaperEngine:
         self._event("INFO", "control", "用户暂停预测模拟策略")
         return "paused"
 
+    def reset_paper(self, budget: float) -> str:
+        """模拟盘仓位重置：清空持仓/预测/成交与权益历史，按给定 USDT 重新起步。
+
+        事件日志保留（审计复盘用）；K 线与行情预热成果不受影响，重置后处于
+        待命状态，需在面板点击"开始"才会产生新的调仓决策。
+        """
+        if not isinstance(budget, (int, float)) or isinstance(budget, bool):
+            raise ValueError("重置金额必须是数字")
+        if not (0 < float(budget) <= 1_000_000):
+            raise ValueError("重置金额必须在 (0, 1000000] USDT 之间")
+        budget = float(budget)
+        self._paused.set()  # 先阻断新的决策
+        with self._tick_lock:  # 等待进行中的 tick 完成
+            self.quote = budget
+            self.base = {pair: 0.0 for pair in self.pairs}
+            self.avg_cost = {pair: None for pair in self.pairs}
+            self.realized_profit = {pair: 0.0 for pair in self.pairs}
+            self.trade_count = {pair: 0 for pair in self.pairs}
+            self.total_fees = 0.0
+            self.target = ()
+            self.predictions = {}
+            self.last_decision_candle_ts = 0
+            self.last_refit_candle_ts = 0
+            self._initial_total = budget
+            self.store.clear_bot_states()
+            self.store.clear_trades()
+            self.store.clear_equity_snapshots()
+            self._save_state()
+        log.warning("预测模拟盘仓位已重置: %.2f USDT", budget)
+        self._event("WARNING", "paper_reset",
+                    f"模拟盘仓位已重置为 {budget:.2f} USDT，持仓/成交记录已清空，"
+                    f"等待开始指令",
+                    detail={"budget": budget})
+        return self.run_status
+
     def resume(self) -> str:
         if self._stopped:
             return "stopped"
@@ -622,7 +660,8 @@ class PredictivePaperEngine:
         return self.resume()
 
     def shutdown(self) -> str:
-        self._save_state()
+        with self._tick_lock:  # 与 reset_paper 互斥，避免重置后又把旧状态落盘
+            self._save_state()
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)

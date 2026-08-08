@@ -81,6 +81,32 @@ async def api_settings() -> JSONResponse:
     return JSONResponse(settings.current())
 
 
+@app.post("/api/reset")
+async def api_reset(req: dict) -> JSONResponse:
+    """模拟盘仓位重置：清空当前策略的持仓/挂单/成交记录，按给定 USDT 重新建仓。
+
+    仅模拟盘可用（实盘引擎会直接拒绝）；重置后策略回到待命状态，
+    需在面板点击"开始"才正式交易。
+    """
+    req = req or {}
+    engine = _pick(req.get("strategy"))
+    try:
+        budget = float(req.get("budget"))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"ok": False, "error": "budget 必须是有效数字"}, status_code=400
+        )
+    try:
+        status = engine.reset_paper(budget)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500
+        )
+    return JSONResponse({"ok": True, "run_status": status})
+
+
 @app.post("/api/settings")
 async def api_settings_update(req: dict) -> JSONResponse:
     """修改运行参数：即时生效并持久化到本地（对所有策略全局生效）。"""

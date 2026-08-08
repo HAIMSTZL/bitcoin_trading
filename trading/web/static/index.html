@@ -255,7 +255,18 @@
   <div class="panel-head">参数配置 <span class="tag">SETTINGS · 鼠标悬停参数名查看说明 · 修改即时生效并本地保存</span></div>
   <div class="panel-body">
     <div class="settings-grid" id="settingsGrid"></div>
-    <div class="settings-note">⚠ 参数对所有策略全局生效；保存于本地 trading/data/overrides.json，重启自动加载。</div>
+    <div class="settings-group" style="margin-top:12px; max-width:340px">
+      <h3>重置模拟盘仓位</h3>
+      <div class="set-row">
+        <span class="tip" data-tip="将当前选项卡策略的模拟盘清空并重建为指定 USDT 数量：持仓、挂单、成交记录与权益曲线全部清零（事件日志保留）。重置后策略回到待命状态，需点击&quot;开始&quot;重新交易。仅模拟盘可用。">重置为 (USDT)</span>
+        <input type="number" id="resetBudget" value="233" min="1" max="1000000" step="1">
+      </div>
+      <div class="set-row">
+        <span style="font-size:10px; color:var(--dim)" id="resetHint">作用于当前选项卡策略</span>
+        <button class="btn stop" onclick="resetPaper()">↺ 重置当前策略</button>
+      </div>
+    </div>
+    <div class="settings-note">⚠ 参数对所有策略全局生效；保存于本地 trading/data/overrides.json，重启自动加载。仓位重置只作用于当前选项卡的策略，且不可撤销。</div>
   </div>
 </div>
 
@@ -645,7 +656,7 @@ const EVENT_TYPE_TEXT = {
   lifecycle: '生命周期', grid_init: '网格初始化', order_placed: '挂单',
   order_filled: '成交', control: '控制', tick_error: '异常', live_order_error: '实盘异常',
   engine_init_error: '行情预热异常', engine_ready: '行情预热完成',
-  health: '健康监测', grid_recenter: '网格重建', signal_change: '信号翻转',
+  paper_reset: '🔄 仓位重置',  health: '健康监测', grid_recenter: '网格重建', signal_change: '信号翻转',
   rebalance: '再平衡', regime_change: '行情切换',
   circuit_breaker: '⛔ 熔断', circuit_resume: '✅ 熔断恢复',
   api_outage: '🔌 API中断', api_recovered: '🔌 API恢复',
@@ -898,6 +909,31 @@ async function saveSetting(key, input) {
   } catch (e) { alert('保存失败: ' + e); }
 }
 
+async function resetPaper() {
+  const budget = parseFloat($('resetBudget').value);
+  if (!(budget > 0) || budget > 1000000) { alert('请输入 (0, 1000000] 之间的 USDT 数量'); return; }
+  const label = stratLabels[currentStrategy] || currentStrategy;
+  const st = stateCache[currentStrategy];
+  if (st && st.mode === 'live') { alert('实盘模式禁止重置账户'); return; }
+  if (!confirm(`确认将【${label}】的模拟盘重置为 ${budget} USDT？\n\n将清空该策略的持仓、挂单、成交记录与权益曲线，此操作不可撤销。\n重置后需点击"开始"重新交易。`)) return;
+  try {
+    const r = await fetch('/api/reset', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy: currentStrategy, budget }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      // 本地缓存的基准/历史已失效，清空以免显示旧数据
+      Object.keys(priceFirst).forEach(k => { if (k.startsWith(currentStrategy + ':')) delete priceFirst[k]; });
+      Object.keys(priceHist).forEach(k => { if (k.startsWith(currentStrategy + ':')) delete priceHist[k]; });
+      eqHists[currentStrategy] = [];
+      alert(`【${label}】已重置为 ${budget} USDT。\n点击"开始"重新交易。`);
+    } else {
+      alert('重置失败: ' + d.error);
+    }
+  } catch (e) { alert('重置失败: ' + e); }
+}
+
 /* ================= 策略选项卡 ================= */
 function renderTabs(list) {
   const el = $('stratTabs');
@@ -917,6 +953,8 @@ function renderTabs(list) {
 
 function switchStrategy(name) {
   currentStrategy = name;
+  const hint = $('resetHint');
+  if (hint) hint.textContent = `作用于: ${stratLabels[name] || name}`;
   // 切到的策略若还没有权益历史，拉一次全量
   if (!eqHists[name] || !eqHists[name].length) {
     fetch('/api/state?s=' + name).then(r => r.json()).then(s => {
