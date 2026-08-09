@@ -41,6 +41,54 @@ def test_grid_resume_warms_next_tick():
                      engine_module._TICKER_INITIAL_WAIT_SEC]
 
 
+def test_grid_tick_publishes_actual_flow_decision():
+    """流程图只能消费本次 tick 的真实撮合结果，不能由前端定时循环伪造。"""
+    class Bot:
+        lower, upper = 1.0, 2.0
+
+        def __init__(self):
+            self.fills = [{
+                "pair": "AAA_USDT", "side": "buy", "price": 1.5, "profit": 0.0,
+            }]
+
+        def step(self, price, account, record):
+            return list(self.fills)
+
+    engine = engine_module.Engine.__new__(engine_module.Engine)
+    bot = Bot()
+    engine._warm_next_tick = False
+    engine._fetch_prices = lambda initial_wait_sec=1.0: {"AAA_USDT": 1.5}
+    engine._check_circuit_breaker = lambda: None
+    engine._update_indicators = lambda: None
+    engine._maybe_rebalance = lambda: None
+    engine._maybe_fill_slot = lambda: None
+    engine._save_bot_states = lambda: None
+    engine._maybe_health_check = lambda: None
+    engine._record_fill = lambda fill: None
+    engine._cb_global = False
+    engine._cb_pairs = {}
+    engine.bots = {"AAA_USDT": bot}
+    engine.prices = {}
+    engine.account = object()
+    engine._last_snapshot = time.time()
+    engine._decision_seq = 0
+    engine._last_decision = None
+
+    engine._tick_body()
+
+    assert engine._last_decision["id"] == 1
+    assert engine._last_decision["kind"] == "fill"
+    assert engine._last_decision["checked_pairs"] == 1
+    assert engine._last_decision["fills"] == [{
+        "pair": "AAA_USDT", "side": "buy", "price": 1.5, "profit": 0.0,
+    }]
+
+    bot.fills = []
+    engine._tick_body()
+    assert engine._last_decision["id"] == 2
+    assert engine._last_decision["kind"] == "wait"
+
+
 def test_predictive_resume_warms_next_tick(monkeypatch):
     engine = predictive_module.PredictivePaperEngine.__new__(
         predictive_module.PredictivePaperEngine)

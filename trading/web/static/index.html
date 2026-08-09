@@ -682,14 +682,34 @@ function animateParticles(ts) {
 }
 requestAnimationFrame(animateParticles);
 
-/* 主链路环境粒子：运行中每 2.5 秒沿 TICK→检测→等待→回环流一圈 */
+/* 流程粒子只响应后端公布的真实 tick 结果；不会为了视觉效果自行循环。 */
 const AMBIENT_LOOP = ['tick>price', 'price>detect', 'detect>wait', 'wait>tick'];
-setInterval(() => {
-  if (!lastState || lastState.run_status !== 'running') return;
-  if (lastState.last_tick && Date.now() / 1000 - lastState.last_tick < 10) {
+const seenDecisionFlows = new Map();
+
+function spawnDecisionParticles(s, flow) {
+  if (!flow || !flow.id || !flow.ts) return;
+  const key = `${s.strategy || 'default'}:${flow.id}:${flow.ts}`;
+  if (seenDecisionFlows.get(s.strategy || 'default') === key) return;
+  seenDecisionFlows.set(s.strategy || 'default', key);
+  // 切换策略/刷新页面不补播过期决策，避免把旧行情误解为刚发生的撮合。
+  if (Date.now() / 1000 - flow.ts > 10) return;
+  if (flow.kind === 'wait') {
     spawnParticle(AMBIENT_LOOP, '#8b949e');
+    return;
   }
-}, 2500);
+  if (flow.kind !== 'fill') return;
+  (flow.fills || []).forEach(fill => {
+    const isBuy = fill.side === 'buy';
+    const branch = isBuy
+      ? ['detect>buy', 'buy>rebuy', 'rebuy>pnl']
+      : ['detect>sell', 'sell>resell', 'resell>pnl'];
+    const color = isBuy ? '#2557d6' : '#c9362b';
+    const path = ['tick>price', 'price>detect', ...branch];
+    spawnParticle(path, color);
+    spawnParticle(path, color, 0.18);
+    spawnParticle([branch[1], branch[2]], '#1a7f37', 0.5);
+  });
+}
 
 /* 成交粒子：买=蓝 卖=红，沿分支流向利润结算 */
 let lastFillEventId = null;
@@ -773,44 +793,40 @@ function updateTree(s) {
       : `Ridge 预测轮动 · 持有 USDT · 等待预测超过 ${fmt((p.threshold || 0) * 100, 2)}% 且 BTC 风控放行`;
     return;
   }
-  spawnFillParticles(s);
   const now = Date.now() / 1000;
-  const active = new Set(['tick', 'price', 'detect']);  // 常态链路
-  // 最近 10 秒内的事件高亮对应节点
-  let lastFill = null, lastPlace = null;
-  for (const e of (s.recent_events || [])) {
-    if (now - e.ts > 10) break;
-    if (e.type === 'order_filled' && !lastFill) lastFill = e;
-    if (e.type === 'order_placed' && !lastPlace) lastPlace = e;
-  }
-  if (lastFill) {
-    try {
-      const d = JSON.parse(lastFill.detail || '{}');
-      if (d.side === 'buy') { active.add('buy'); active.add('rebuy'); }
-      else { active.add('sell'); active.add('resell'); active.add('pnl'); }
-    } catch (_) { active.add('pnl'); }
-  } else if (lastPlace) {
-    try {
-      const d = JSON.parse(lastPlace.detail || '{}');
-      active.add(d.side === 'buy' ? 'rebuy' : 'resell');
-    } catch (_) {}
+  const flow = s.decision_flow || {};
+  const fresh = flow.ts && now - flow.ts < 10;
+  const active = new Set();
+  if (fresh) {
+    active.add('tick'); active.add('price'); active.add('detect');
+    if (flow.kind === 'wait') active.add('wait');
+    if (flow.kind === 'fill') (flow.fills || []).forEach(fill => {
+      if (fill.side === 'buy') { active.add('buy'); active.add('rebuy'); }
+      else { active.add('sell'); active.add('resell'); }
+      active.add('pnl');
+    });
   }
   NODES.forEach(([id]) => {
     const el = $('node-' + id);
     if (el) el.classList.toggle('active', active.has(id));
   });
-  // 底部动作条
+  spawnDecisionParticles(s, flow);
+  // 底部动作条：严格对应本次后端 tick 的判断，而不是最近一笔历史成交。
   const strip = $('actionStrip');
-  const fills = (s.recent_events || []).filter(e => e.type === 'order_filled');
-  if (fills.length) {
-    const d = JSON.parse(fills[0].detail || '{}');
-    const txt = `网格成交 · ${d.pair} ${d.side === 'buy' ? '买入' : '卖出'} @ ${fmtPrice(d.price)} · 利润 ${fmt(d.profit, 4)} USDT`;
-    if (strip.textContent !== txt) {
-      strip.textContent = txt;
-      strip.classList.remove('flash'); void strip.offsetWidth; strip.classList.add('flash');
-    }
-  } else {
-    strip.textContent = '等待价格触及网格档位…';
+  let txt = '等待首次真实 tick 决策…';
+  if (flow.kind === 'fill') {
+    const details = (flow.fills || []).map(d =>
+      `${d.pair} ${d.side === 'buy' ? '买入' : '卖出'} @ ${fmtPrice(d.price)} · 利润 ${fmt(d.profit, 4)}U`
+    ).join('；');
+    txt = `本次 TICK #${flow.id} 成交 · ${details}`;
+  } else if (flow.kind === 'wait') {
+    txt = `本次 TICK #${flow.id}：已检测 ${flow.checked_pairs || 0} 个网格，未触及可成交档位 · 等待下一 TICK`;
+  } else if (flow.kind === 'frozen') {
+    txt = `本次 TICK #${flow.id}：可交易网格已被熔断冻结，等待恢复`;
+  }
+  if (strip.textContent !== txt) {
+    strip.textContent = txt;
+    strip.classList.remove('flash'); void strip.offsetWidth; strip.classList.add('flash');
   }
 }
 

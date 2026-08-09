@@ -303,6 +303,9 @@ class Engine:
         self.started_at = time.time()
         self.last_tick: Optional[float] = None
         self.last_error: Optional[str] = None
+        # 仅供 Web 决策流展示的最近一次真实 tick 结果；不落库，重启后不回放旧动画。
+        self._decision_seq = 0
+        self._last_decision: dict[str, Any] | None = None
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._stopped = False
@@ -715,6 +718,34 @@ class Engine:
         with self._tick_lock:
             self._tick_body()
 
+    def _record_tick_decision(
+        self,
+        fills: list[dict],
+        checked_pairs: int,
+        skipped_pairs: list[str],
+    ) -> None:
+        """发布本次 tick 的真实决策结果，供前端精确驱动流程动画。"""
+        self._decision_seq = getattr(self, "_decision_seq", 0) + 1
+        timestamp = self.last_tick or time.time()
+        compact_fills = [
+            {
+                "pair": fill["pair"], "side": fill["side"],
+                "price": fill["price"], "profit": fill["profit"],
+            }
+            for fill in fills
+        ]
+        all_frozen = not checked_pairs and bool(skipped_pairs) and (
+            self._cb_global or all(pair in self._cb_pairs for pair in skipped_pairs)
+        )
+        self._last_decision = {
+            "id": self._decision_seq,
+            "ts": timestamp,
+            "kind": "fill" if compact_fills else ("frozen" if all_frozen else "wait"),
+            "checked_pairs": checked_pairs,
+            "skipped_pairs": skipped_pairs,
+            "fills": compact_fills,
+        }
+
     def _tick_body(self) -> None:
         if self._warm_next_tick:
             self._warm_next_tick = False
@@ -725,16 +756,23 @@ class Engine:
         self._update_indicators()
         if not self._cb_global:
             self._maybe_rebalance()
+        fills: list[dict] = []
+        checked_pairs = 0
+        skipped_pairs: list[str] = []
         for pair, bot in self.bots.items():
             if self._cb_global or pair in self._cb_pairs:
+                skipped_pairs.append(pair)
                 continue  # 熔断中：不撮合、不补单
             price = self.prices.get(pair)
             if not price:
+                skipped_pairs.append(pair)
                 continue
             if config.AUTO_RECENTER and (price > bot.upper or price < bot.lower):
                 self._recenter(pair, price)
-            self.bots[pair].step(price, self.account, record=self._record_fill)
+            fills.extend(self.bots[pair].step(price, self.account, record=self._record_fill))
+            checked_pairs += 1
         self.last_tick = time.time()
+        self._record_tick_decision(fills, checked_pairs, skipped_pairs)
         self._maybe_fill_slot()  # 空仓槽位补位筛选
         self._save_bot_states()  # 模拟盘每个 tick 落盘，保证重启后可续跑
 
@@ -1226,6 +1264,8 @@ class Engine:
             self.store.clear_trades()
             self.store.clear_equity_snapshots()
             self.store.delete_meta("initial_equity")
+            self._decision_seq = 0
+            self._last_decision = None
             self._budget_override = budget
             self._initial_total = 0.0
             self._initial_equity_persisted = False
@@ -1286,6 +1326,7 @@ class Engine:
             "started_at": self.started_at,
             "last_tick": self.last_tick,
             "last_error": self.last_error,
+            "decision_flow": dict(getattr(self, "_last_decision", None) or {}),
             "total_equity": total_equity,
             "total_initial_equity": total_initial,
             "total_pnl": total_pnl,
