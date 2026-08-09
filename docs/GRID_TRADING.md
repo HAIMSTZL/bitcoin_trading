@@ -69,7 +69,7 @@
 ```
 ┌─────────────────────────────────────────────────────┐
 │  run.py（入口）                                       │
-│  ├── 日志初始化（控制台 + trading.log 轮转文件）        │
+│  ├── 日志初始化（控制台 + log/ 按天分文件）             │
 │  ├── Engine（交易引擎，独立线程）                       │
 │  └── uvicorn（Web 服务，主线程）                       │
 ├─────────────────────────────────────────────────────┤
@@ -382,7 +382,7 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 
 ### 8.2 文本日志
 
-`trading/data/trading.log`（5MB × 3 轮转），与控制台同步，异常带完整堆栈。
+`log/trading_YYYY-MM-DD.log`（按天分文件，跨天自动切换，保留 30 天），与控制台同步，异常带完整堆栈。
 
 ### 8.3 复盘口径
 

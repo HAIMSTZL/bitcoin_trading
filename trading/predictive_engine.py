@@ -38,6 +38,12 @@ from .store import Store
 
 log = logging.getLogger("trading.predictive_engine")
 _STATE_KEY = "__predictive_portfolio__"
+# 十个币对由四个共享 worker 分批预热；预测策略的首轮预算可单独配置，且不低于
+# 通用引擎预热预算。它只影响后台策略线程，不会阻塞 Web 服务。
+_PREDICTIVE_TICKER_WARM_WAIT_SEC = max(
+    _TICKER_BOOTSTRAP_WAIT_SEC, config.PREDICTIVE_TICKER_WARM_WAIT_SEC,
+)
+_PRICE_PARTIAL_EVENT_INTERVAL_SEC = 60.0
 
 
 class PredictivePaperEngine:
@@ -111,6 +117,11 @@ class PredictivePaperEngine:
         self._tick_lock = threading.Lock()
         # 恢复/重启交易后的首个 tick：暂停期间缓存必然过期，用预热预算等行情
         self._warm_next_tick = False
+        # 任一 ticker 不可用时，绝不以价格子集估值或调仓；保留上一帧完整价格供
+        # 面板展示，并明确记录本轮决策跳过。恢复完整行情后再继续。
+        self._price_partial_missing: tuple[str, ...] = ()
+        self._price_partial_since: float | None = None
+        self._last_price_partial_event = 0.0
 
         self._restore_or_seed()
         self._load_cached_history()
@@ -320,7 +331,7 @@ class PredictivePaperEngine:
         # 这是后台预热而不是 tick：给四并发行情请求足够时间完成两三批，避免
         # 网络正常但 RTT 略高于运行时 1 秒预算时反复预热失败。不会占用 ticker 锁。
         self.prices = _fetch_tickers_cached(
-            None, self.pairs, initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC,
+            None, self.pairs, initial_wait_sec=_PREDICTIVE_TICKER_WARM_WAIT_SEC,
         )
         missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
         if missing:
@@ -520,19 +531,62 @@ class PredictivePaperEngine:
     # ------------------------------------------------------------------
     # 引擎循环、控制与 Web 状态
     # ------------------------------------------------------------------
-    def tick(self) -> None:
+    def _mark_prices_partial(self, missing: list[str]) -> None:
+        """记录行情子集缺失，并把本轮调仓明确置为暂停。
+
+        价格子集不能用于组合估值或成交：例如缺失的是当前持仓币，对剩余币报价
+        再新也不能安全地计算等权再平衡。因此这里只保留上次完整帧，等待后台
+        ticker worker 补齐；不把可自愈的网络短抖动升级成 ``tick_error``。
+        """
+        now = time.time()
+        current = tuple(sorted(missing))
+        changed = current != self._price_partial_missing
+        if not self._price_partial_missing:
+            self._price_partial_since = now
+        self._price_partial_missing = current
+        self.last_error = (
+            f"行情暂不完整，已跳过本轮预测调仓：{', '.join(current)}"
+        )
+        if changed or now - self._last_price_partial_event >= _PRICE_PARTIAL_EVENT_INTERVAL_SEC:
+            self._last_price_partial_event = now
+            self._event(
+                "WARNING", "predictive_price_partial", self.last_error,
+                detail={"missing": list(current), "since": self._price_partial_since},
+            )
+
+    def _mark_prices_complete(self) -> None:
+        """行情由不完整恢复完整时清理告警并留下一条可审计事件。"""
+        if not self._price_partial_missing:
+            return
+        missing = self._price_partial_missing
+        since = self._price_partial_since
+        self._price_partial_missing = ()
+        self._price_partial_since = None
+        self.last_error = None
+        self._event(
+            "INFO", "predictive_price_recovered",
+            f"预测币池行情已恢复完整：{', '.join(missing)}",
+            detail={"previous_missing": list(missing), "partial_since": since},
+        )
+
+    def tick(self) -> bool:
         # 先确认已收盘 K 线，再读取成交用 ticker，避免使用刷新历史之前的旧报价。
         self._refresh_history()
         if self._warm_next_tick:
             self._warm_next_tick = False
-            self.prices = _fetch_tickers_cached(
-                None, self.pairs, initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC)
+            observed_prices = _fetch_tickers_cached(
+                None, self.pairs, initial_wait_sec=_PREDICTIVE_TICKER_WARM_WAIT_SEC,
+                allow_partial=True,
+            )
         else:
-            self.prices = _fetch_tickers_cached(None, self.pairs)
-        self._price_observed_at = time.time()
-        missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
+            observed_prices = _fetch_tickers_cached(None, self.pairs, allow_partial=True)
+        missing = [pair for pair in self.pairs if observed_prices.get(pair, 0.0) <= 0]
         if missing:
-            raise RuntimeError(f"未获取到预测币池行情: {', '.join(missing)}")
+            self._mark_prices_partial(missing)
+            return False
+        self.prices = observed_prices
+        self._price_observed_at = time.time()
+        self._mark_prices_complete()
         self._maybe_decide()
         self.last_tick = time.time()
         self._save_state()
@@ -543,6 +597,7 @@ class PredictivePaperEngine:
                 {pair: self.base[pair] * self.prices[pair] for pair in self.pairs},
             )
         self._maybe_health_check()
+        return True
 
     def _maybe_health_check(self) -> None:
         now = time.time()
@@ -586,12 +641,17 @@ class PredictivePaperEngine:
                 continue
             try:
                 with self._tick_lock:  # 与 reset_paper 互斥
-                    self.tick()
-                self.last_error = None
-                self._last_success = time.time()
-                if self._api_outage:
-                    self._api_outage = False
-                    self._event("INFO", "api_recovered", "预测策略 API 已恢复")
+                    tick_complete = self.tick()
+                if tick_complete:
+                    self.last_error = None
+                    self._last_success = time.time()
+                    if self._api_outage:
+                        self._api_outage = False
+                        self._event("INFO", "api_recovered", "预测策略 API 已恢复")
+                elif (self._last_success and time.time() - self._last_success
+                      > config.API_OUTAGE_ALERT_SEC and not self._api_outage):
+                    self._api_outage = True
+                    self._event("ERROR", "api_outage", f"预测策略 API 持续中断：{self.last_error}")
             except Exception as error:
                 self.last_error = f"{type(error).__name__}: {error}"
                 log.exception("预测策略 tick 失败")
@@ -679,10 +739,19 @@ class PredictivePaperEngine:
         return "stopped"
 
     def stop(self) -> None:
-        self._save_state()
+        """进程退出收尾：先停决策线程，再做最终状态落盘，最后关闭存储。"""
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        if self._tick_lock.acquire(timeout=5):
+            try:
+                self._save_state()
+            except Exception:
+                log.exception("停止时状态落盘失败")
+            finally:
+                self._tick_lock.release()
+        else:
+            log.warning("停止时未能取得 tick 锁，跳过最终落盘（以上一 tick 状态为准）")
         self.store.close()
         self.client.close()
 
@@ -753,6 +822,10 @@ class PredictivePaperEngine:
                 "ready": self._ready.is_set(), "initializing": self._initializing,
                 "init_error": self._init_error, "cache_path": str(self._cache_path),
                 "ticker_observed_at": self._price_observed_at,
+                "price_partial": {
+                    "missing": list(self._price_partial_missing),
+                    "since": self._price_partial_since,
+                },
                 "decision_paused": self._decision_pause_reason is not None,
                 "decision_pause_reason": self._decision_pause_reason,
                 "candle_lag_seconds": self._candle_lag_seconds,

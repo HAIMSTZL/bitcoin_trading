@@ -49,6 +49,11 @@ PREDICTIVE_CACHE_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "predictive_1h_cache.json"),
 )
 PREDICTIVE_INIT_RETRY_SEC = float(os.environ.get("PREDICTIVE_INIT_RETRY_SEC", "30"))
+# 十币预测池由四个共享 ticker worker 预热；首个交易 tick 多等一会儿，避免网络正常
+# 但首批连接尚未完成时误判为行情失败。运行中仍采用短等待并可安全跳过不完整轮次。
+PREDICTIVE_TICKER_WARM_WAIT_SEC = float(
+    os.environ.get("PREDICTIVE_TICKER_WARM_WAIT_SEC", "15")
+)
 # 共同已收盘 K 线晚于当前时间该阈值时，预测策略明确暂停调仓而非静默使用旧特征。
 PREDICTIVE_MAX_CANDLE_LAG_SEC = float(os.environ.get("PREDICTIVE_MAX_CANDLE_LAG_SEC", "7200"))
 # 已验证的研究候选：48h 预测、24h 调仓、120 天训练、每周重训、BTC 168h EMA 风控。
@@ -62,7 +67,7 @@ PREDICTIVE_MARKET_EMA = int(os.environ.get("PREDICTIVE_MARKET_EMA", "168"))
 # 模拟盘采用比研究默认值更保守的 10 bps 单侧滑点，先用实际观察校准。
 PREDICTIVE_SLIPPAGE_BPS = float(os.environ.get("PREDICTIVE_SLIPPAGE_BPS", "10"))
 
-# ---- DOGE 趋势恢复策略模拟盘（严格 paper-only）----
+# ---- 低吸先锋策略模拟盘（严格 paper-only；BTC/ETH/DOGE 复用同一状态机）----
 # 单币策略仍使用独立缓存和数据库，避免和十币预测轮动争用/覆盖快照。
 DOGE_TREND_HISTORY_DAYS = int(os.environ.get("DOGE_TREND_HISTORY_DAYS", "150"))
 DOGE_TREND_KLINE_REFRESH_SEC = float(

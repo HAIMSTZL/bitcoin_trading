@@ -737,6 +737,7 @@ function updateTree(s) {
   if (s.strategy_kind === 'doge_trend') {
     spawnFillParticles(s);
     const d = s.doge_trend || {};
+    const label = s.strategy_label || `${d.asset || '单币'} 低吸先锋`;
     const active = new Set(['tick', 'price', 'detect']);
     const latestFill = (s.recent_events || []).find(e => e.type === 'doge_trend_fill');
     if (latestFill) {
@@ -754,18 +755,18 @@ function updateTree(s) {
     const strip = $('actionStrip');
     if (!d.ready) {
       strip.textContent = d.init_error
-        ? `DOGE 行情预热失败，正在自动重试：${d.init_error}`
-        : 'DOGE 趋势行情预热中：优先读取本地 1h K 线缓存，再补齐最新已收盘 K 线';
+        ? `${label} 行情预热失败，正在自动重试：${d.init_error}`
+        : `${label} 行情预热中：优先读取本地 1h K 线缓存，再补齐最新已收盘 K 线`;
       return;
     }
     if (d.decision_paused) {
-      strip.textContent = `DOGE 新建仓/加仓已暂停：${d.decision_pause_reason || '已收盘 K 线过期'}；已有仓位仍执行止盈止损`;
+      strip.textContent = `${label} 新建仓/加仓已暂停：${d.decision_pause_reason || '已收盘 K 线过期'}；已有仓位仍执行止盈止损`;
       return;
     }
     const rsi = d.rsi_20 === null || d.rsi_20 === undefined ? '--' : fmt(d.rsi_20, 2);
     const ema = d.ema_6 === null || d.ema_6 === undefined ? '--' : fmtPrice(d.ema_6);
     const target = d.pending_target ? ` · 待成交目标 ${fmt(d.pending_target * 100, 0)}%` : '';
-    strip.textContent = `DOGE 趋势恢复 · ${d.stage || '等待信号'} · RSI20 ${rsi} · EMA6 ${ema}${target}`;
+    strip.textContent = `${label} · ${d.stage || '等待信号'} · RSI20 ${rsi} · EMA6 ${ema}${target}`;
     return;
   }
   if (s.strategy_kind === 'predictive') {
@@ -844,20 +845,21 @@ const EVENT_TYPE_TEXT = {
   predictive_init_error: '预测预热异常', predictive_cache: 'K线缓存',
   predictive_cache_invalid: 'K线缓存无效', predictive_cache_error: 'K线缓存异常',
   predictive_history_partial: 'K线部分失败',
+  predictive_price_partial: '行情部分缺失', predictive_price_recovered: '行情恢复完整',
   predictive_decision_paused: '预测调仓暂停', predictive_decision_resumed: '预测调仓恢复',
   screen_start: '🔍 开始筛选', screen_none: '🔍 无合格候选', screen_error: '🔍 筛选失败',
   slot_replace: '🔄 槽位替换',
   predictive_history: '🧠 预测历史', predictive_train: '🧠 模型训练',
   predictive_signal: '🧠 预测信号', predictive_rebalance: '🧠 预测调仓',
   predictive_fill: '🧠 虚拟成交', predictive_score: '🧠 恢复评分',
-  doge_trend_init: 'DOGE 预热', doge_trend_ready: 'DOGE 就绪',
-  doge_trend_init_error: 'DOGE 预热异常', doge_trend_cache: 'DOGE K线缓存',
-  doge_trend_cache_invalid: 'DOGE 缓存无效', doge_trend_cache_error: 'DOGE 缓存异常',
-  doge_trend_history: 'DOGE K线更新', doge_trend_history_partial: 'DOGE K线部分失败',
-  doge_trend_decision_paused: 'DOGE 决策暂停', doge_trend_decision_resumed: 'DOGE 决策恢复',
-  doge_trend_signal: 'DOGE 趋势信号', doge_trend_fill: 'DOGE 虚拟成交',
-  doge_trend_rearmed: 'DOGE RSI 重新武装',
-  doge_trend_resume_gap: 'DOGE 离线缺口', doge_trend_signal_cancelled: 'DOGE 信号取消',
+  doge_trend_init: '低吸预热', doge_trend_ready: '低吸就绪',
+  doge_trend_init_error: '低吸预热异常', doge_trend_cache: '低吸 K线缓存',
+  doge_trend_cache_invalid: '低吸缓存无效', doge_trend_cache_error: '低吸缓存异常',
+  doge_trend_history: '低吸 K线更新', doge_trend_history_partial: '低吸 K线部分失败',
+  doge_trend_decision_paused: '低吸决策暂停', doge_trend_decision_resumed: '低吸决策恢复',
+  doge_trend_signal: '低吸趋势信号', doge_trend_fill: '低吸虚拟成交',
+  doge_trend_rearmed: '低吸 RSI 重新武装',
+  doge_trend_resume_gap: '低吸离线缺口', doge_trend_signal_cancelled: '低吸信号取消',
 };
 const SIGNAL_TEXT = { 1: '偏多·停卖', 0: '中性', '-1': '偏空·停买' };
 const SIGNAL_CLS = { 1: 'up', 0: '', '-1': 'down' };
@@ -919,6 +921,10 @@ function render(s) {
   if (cb.global) cbHtml = '<span class="err">⛔ 大盘熔断中：全系统停止交易，等待 BTC 企稳</span>';
   else if (cb.pairs && cb.pairs.length) cbHtml = `<span class="err">⛔ 熔断中: ${cb.pairs.join(', ')}</span>`;
   if (s.api_outage) cbHtml += ' <span class="err">🔌 API 持续中断中，自动重试…</span>';
+  const partialTickers = s.predictive?.price_partial?.missing || [];
+  if (partialTickers.length) {
+    cbHtml += ` <span class="err">⏳ 预测行情暂缺 ${esc(partialTickers.join(', '))}，本轮调仓已跳过</span>`;
+  }
   $('stErr').innerHTML = cbHtml || (s.last_error ? `<span class="err">⚠ 异常: ${esc(s.last_error)}</span>` : '');
 
   /* 行情条 */
@@ -987,14 +993,16 @@ function render(s) {
       </div>`;
     }).join('');
   } else if (s.strategy_kind === 'doge_trend') {
-    const d = s.doge_trend || {}, doge = s.pairs.DOGE_USDT || {};
+    const d = s.doge_trend || {};
+    const coin = Object.values(s.pairs).find(row => row.pair !== 'USDT') || {};
+    const pairLabel = coin.pair ? coin.pair.replace('_', '/') : (d.pair || '--');
     const rsi = d.rsi_20 === null || d.rsi_20 === undefined ? '等待足够 K 线' : fmt(d.rsi_20, 2);
     const ema = d.ema_6 === null || d.ema_6 === undefined ? '--' : fmtPrice(d.ema_6);
     const cost = d.average_cost === null || d.average_cost === undefined ? '--' : fmtPrice(d.average_cost);
     const take = d.take_price === null || d.take_price === undefined ? '--' : fmtPrice(d.take_price);
     const stop = d.stop_price === null || d.stop_price === undefined ? '--' : fmtPrice(d.stop_price);
     $('scanRows').innerHTML = `<div class="scan-row">
-      <div class="scan-head"><span>DOGE/USDT <b class="${doge.base > 0 ? 'up' : ''}" style="font-size:10px">${esc(d.stage || '等待超卖')}</b></span><span class="mono-num">${fmtPrice(doge.price || 0)}</span></div>
+      <div class="scan-head"><span>${esc(pairLabel)} <b class="${coin.base > 0 ? 'up' : ''}" style="font-size:10px">${esc(d.stage || '等待超卖')}</b></span><span class="mono-num">${fmtPrice(coin.price || 0)}</span></div>
       <div class="scan-mid"><span>RSI(20) <b class="mono-num ${d.rsi_20 < 25 ? 'side-buy' : ''}">${rsi}</b></span><span>EMA(6) <b class="mono-num">${ema}</b></span></div>
       <div class="scan-mid"><span>仓位 <b class="mono-num">${fmt((d.position_weight || 0) * 100, 1)}%</b></span><span>持仓 ${d.held_bars || 0}/${d.max_hold_bars || 72}h</span></div>
       <div class="scan-mid"><span>均价 <b class="mono-num">${cost}</b></span><span>止盈 <b class="mono-num side-sell">${take}</b></span><span>止损 <b class="mono-num down">${stop}</b></span></div>

@@ -4,12 +4,14 @@ from trading import config
 from trading.backtest import Candle
 from trading.doge_trend import DogeTrendSettings
 from trading.doge_trend_engine import DogeTrendPaperEngine
+from trading.profiles import PROFILES
 
 
 def _paper_engine() -> tuple[DogeTrendPaperEngine, list[dict]]:
     """不联网的最小模拟盘对象，用于资金和信号时序测试。"""
     engine = DogeTrendPaperEngine.__new__(DogeTrendPaperEngine)
     engine.pair = "DOGE_USDT"
+    engine.asset = "DOGE"
     engine.pairs = [engine.pair]
     engine.settings = DogeTrendSettings(total_quote_budget=100, fee_rate=0.001, slippage_bps=10)
     engine.prices = {engine.pair: 1.0}
@@ -34,6 +36,14 @@ def _paper_engine() -> tuple[DogeTrendPaperEngine, list[dict]]:
     engine._record_fill = fills.append
     engine._event = lambda *args, **kwargs: None
     return engine, fills
+
+
+def test_btc_eth_dip_profiles_are_independent_single_coin_paper_profiles():
+    for name, pair in (("btc_dip", "BTC_USDT"), ("eth_dip", "ETH_USDT")):
+        profile = PROFILES[name]
+        assert profile.kind == "doge_trend"
+        assert profile.pairs == (pair,)
+        assert profile.db_path.endswith(f"trading_{name}.db")
 
 
 def test_doge_trend_staged_buy_then_full_exit_charges_costs():
@@ -126,6 +136,22 @@ def test_doge_trend_constructor_is_nonblocking_and_paper_only(tmp_path, monkeypa
         assert engine.prices == {"DOGE_USDT": 0.0}
         assert engine.candles == []
         assert engine.state()["strategy_kind"] == "doge_trend"
+    finally:
+        engine.stop()
+
+
+def test_btc_dip_constructor_uses_btc_and_its_own_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    profile = SimpleNamespace(
+        kind="doge_trend", pairs=("BTC_USDT",), db_path=str(tmp_path / "btc.db"),
+        name="btc_dip", label="BTC 低吸先锋",
+    )
+    engine = DogeTrendPaperEngine(profile)
+    try:
+        assert engine.pair == "BTC_USDT"
+        assert engine.asset == "BTC"
+        assert engine.prices == {"BTC_USDT": 0.0}
+        assert engine._cache_path == tmp_path / "btc_dip_1h_cache.json"
     finally:
         engine.stop()
 

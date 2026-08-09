@@ -71,10 +71,23 @@ PROFILES: dict[str, Profile] = {
         use_signal_filter=False, adaptive_range=False,
         dynamic_allocation=False, slot_rotation=False,
     ),
-    # DOGE 单币研究候选：RSI 超卖半仓试探，EMA 恢复且高于成本后才加至满仓。
+    # 低吸先锋：同一 RSI/EMA 状态机分别在三个高流动性币对独立前向模拟；
+    # 每个 Profile 各有独立模拟账户、SQLite 和 K 线缓存，绝不共享资金或仓位。
     "doge_trend": Profile(
         name="doge_trend", label="DOGE 低吸先锋",
         pairs=("DOGE_USDT",), kind="doge_trend",
+        use_signal_filter=False, adaptive_range=False,
+        dynamic_allocation=False, slot_rotation=False,
+    ),
+    "btc_dip": Profile(
+        name="btc_dip", label="BTC 低吸先锋",
+        pairs=("BTC_USDT",), kind="doge_trend",
+        use_signal_filter=False, adaptive_range=False,
+        dynamic_allocation=False, slot_rotation=False,
+    ),
+    "eth_dip": Profile(
+        name="eth_dip", label="ETH 低吸先锋",
+        pairs=("ETH_USDT",), kind="doge_trend",
         use_signal_filter=False, adaptive_range=False,
         dynamic_allocation=False, slot_rotation=False,
     ),

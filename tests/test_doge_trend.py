@@ -92,10 +92,19 @@ def test_stop_loss_requires_rsi_rearm_before_another_oversold_entry():
     assert result.entry_count == 1
 
 
-def test_strategy_rejects_non_doge_pair_and_walk_forward_resets_capital():
+@pytest.mark.parametrize("pair", ["BTC_USDT", "ETH_USDT", "DOGE_USDT"])
+def test_strategy_accepts_each_low_absorption_pair(pair):
     candles = [Candle(index * 60, 1, 1, 1, 1) for index in range(10)]
-    with pytest.raises(ValueError, match="DOGE_USDT"):
-        run_doge_trend_backtest(candles, DogeTrendSettings(pair="BTC_USDT"))
+    result = run_doge_trend_backtest(
+        candles, DogeTrendSettings(pair=pair, rsi_period=2, confirmation_ema_period=2),
+    )
+    assert result.initial_equity > 0
+
+
+def test_strategy_rejects_unsupported_pair_and_walk_forward_resets_capital():
+    candles = [Candle(index * 60, 1, 1, 1, 1) for index in range(10)]
+    with pytest.raises(ValueError, match="低吸先锋"):
+        run_doge_trend_backtest(candles, DogeTrendSettings(pair="SOL_USDT"))
 
     report = run_doge_walk_forward(
         candles,

@@ -62,6 +62,8 @@ TRADING_MODE=live LIVE_TRADING_CONFIRM=YES_I_ACCEPT_RISK .venv/bin/python run.py
 | `hunter` 猎手精选 | 启动即全市场筛选 Top3 建仓，无信号过滤激进风格 |
 | `predictive` 先知轮动 | 独立 paper-only：1h K 线滚动 Ridge、纯 USDT 起步、long/flat、每日决策 |
 | `doge_trend` DOGE 低吸先锋 | 独立 paper-only：DOGE 单币、RSI 超卖 50% 试探、EMA 恢复确认后才加至满仓 |
+| `btc_dip` BTC 低吸先锋 | 与 DOGE 相同状态机，独立账户、缓存与前向模拟记录 |
+| `eth_dip` ETH 低吸先锋 | 与 DOGE 相同状态机，独立账户、缓存与前向模拟记录 |
 
 策略定义在 `trading/profiles.py`，可自行增删改。
 
@@ -72,10 +74,12 @@ K 线缓存保存于 `trading/data/predictive_1h_cache.json`：服务先立即�
 补齐最新 K 线；首次无缓存时也不会阻塞其他策略。完成预热后，它会显示为就绪，点击该 Tab 的开始
 按钮才产生前向模拟交易。
 
-`doge_trend` 只交易 `DOGE_USDT`，单独使用 `trading/data/trading_doge_trend.db` 与
-`trading/data/doge_trend_1h_cache.json`，并同样代码级禁止 live 模式。回测以“下一根开盘”作为
-可复现代理；模拟盘则在新的已收盘 1h K 线出现后按当前 ticker 加每侧 10 bps 保守滑点成交，成交事件会
-写入信号 K 线、ticker 观察时间与价格来源。服务重启期间不会追补历史交易，避免把离线行情伪造成前向收益。
+`doge_trend`、`btc_dip` 与 `eth_dip` 分别只交易 DOGE、BTC、ETH；三者使用完全相同的低吸状态机，
+但各自拥有独立模拟账户、SQLite 与 K 线缓存（DOGE 沿用 `doge_trend_1h_cache.json`，BTC/ETH 使用各自
+策略名缓存），并同样代码级禁止 live 模式。回测以“下一根开盘”作为可复现代理；模拟盘则在新的已收盘 1h
+K 线出现后按当前 ticker 加每侧 10 bps 保守滑点成交，成交事件会写入信号 K 线、ticker 观察时间与价格
+来源。服务重启期间不会追补历史交易，避免把离线行情伪造成前向收益。BTC/ETH 目前是 DOGE 候选的机械复制，
+只用于独立前向观察，不代表它们已完成独立的回测验证。
 
 - 网格参数（区间幅度、层数）在 `trading/config.py` 中调整；
 - **启动流程**：服务启动后只做环境初始化，处于待命状态，需在面板点击 **开始** 才正式交易：
@@ -86,13 +90,14 @@ K 线缓存保存于 `trading/data/predictive_1h_cache.json`：服务先立即�
   - 想清空模拟盘重新来过：删掉 `trading/data/trading.db` 即可；
 - 面板右上角有 **开始 / 暂停 / 停止** 按钮（对应 `POST /api/control`）：
   暂停只挂起交易循环；停止会终止引擎但保留 Web 服务，之后可再点开始恢复；
-  彻底退出进程请在终端 Ctrl+C；
+  彻底退出进程请运行 `bash stop.sh`（或终端 Ctrl+C）：SIGTERM 触发优雅退出，
+  各引擎先停交易线程、再把网格/持仓状态最终落盘后才退出进程；
 - 成交记录与权益曲线持久化在 `trading/data/trading.db`。
 - **日志（供复盘）**：
   - 结构化事件入库 `trading.db` 的 `events` 表——挂单、成交、网格初始化、启动/暂停/停止
     控制、异常（含堆栈）全覆盖，面板底部"运行日志"区块实时展示；
-  - 文本日志同时写控制台和 `log/` 目录（Logger + 每日 0 点滚动，历史文件按日期命名
-    如 `trading.log.2026-08-04`，保留 30 天；每行含 时间|级别|文件:代码行|模块|内容）；
+  - 文本日志同时写控制台和 `log/` 目录（按天分文件，当天日志直接写入以日期命名的
+    文件如 `trading_2026-08-09.log`，跨天自动切换，保留 30 天；每行含 时间|级别|文件:代码行|模块|内容）；
   - 所有异常（tick 循环、实盘下单、控制接口、引擎初始化）均已捕获并记录，不会静默失败。
 - 实盘风控：币对白名单强制校验 + 单笔 USDT 上限（`MAX_ORDER_QUOTE`，默认 50）。
 

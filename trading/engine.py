@@ -188,6 +188,7 @@ def _cached_ticker_or_error(pair: str) -> float | None:
 
 def _fetch_tickers_cached(
     spot: SpotAPI | None, pairs, *, initial_wait_sec: float = _TICKER_INITIAL_WAIT_SEC,
+    allow_partial: bool = False,
 ) -> dict[str, float]:
     """只读缓存并安排后台 ticker 刷新，不让行情网络阻塞策略 tick。
 
@@ -196,7 +197,9 @@ def _fetch_tickers_cached(
     和 ReadTimeout 风险。因此每个失效币对只发一个小请求。缓存锁只保护数据结构；
     网络请求由最多四个后台线程执行；策略 tick 首次无缓存默认只等待一秒。后台
     初始化调用者可显式提供较长窗口，但等待不占用缓存锁，也不阻塞 Web 服务。
-    ``spot`` 仅供测试/显式注入，生产传 ``None``。
+    ``spot`` 仅供测试/显式注入，生产传 ``None``。``allow_partial`` 仅供
+    能够安全跳过本次决策的调用者使用：它会返回可用的子集而非抛出异常；调用者
+    不得以该子集做组合估值、调仓或撮合。
     """
     requested = tuple(sorted(set(pairs)))
     pending: dict[str, threading.Event] = {}
@@ -221,6 +224,8 @@ def _fetch_tickers_cached(
         else:
             values[pair] = value
     if missing:
+        if allow_partial:
+            return {pair: values[pair] for pair in requested if pair in values}
         raise RuntimeError(
             f"ticker 无可用价格（预热中、连续失败或缓存过期）: {', '.join(missing)}"
         )
@@ -1291,9 +1296,21 @@ class Engine:
         return "running"
 
     def stop(self) -> None:
+        """进程退出收尾：先停交易线程，再做最终状态落盘，最后关闭存储。"""
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        # 线程结束后再落盘，避免与进行中的 tick 并发写状态；
+        # 锁拿不到（极端情况下 tick 卡死）则跳过，最多丢失一个 tick 的网格状态
+        if self._tick_lock.acquire(timeout=5):
+            try:
+                self._save_bot_states()
+            except Exception:
+                log.exception("停止时状态落盘失败")
+            finally:
+                self._tick_lock.release()
+        else:
+            log.warning("停止时未能取得 tick 锁，跳过最终落盘（以上一 tick 状态为准）")
         self.store.close()
 
     # ------------------------------------------------------------------

@@ -96,6 +96,10 @@ def test_predictive_resume_warms_next_tick(monkeypatch):
     engine._paused = threading.Event()
     engine._paused.set()
     engine._warm_next_tick = False
+    engine._price_partial_missing = ()
+    engine._price_partial_since = None
+    engine._last_price_partial_event = 0.0
+    engine.last_error = None
     engine._ready = threading.Event()
     engine._ready.set()
     engine._event = lambda *args, **kwargs: None
@@ -104,7 +108,8 @@ def test_predictive_resume_warms_next_tick(monkeypatch):
     assert engine._warm_next_tick is True
 
     waits = []
-    def fake_fetch(spot, pairs, *, initial_wait_sec=engine_module._TICKER_INITIAL_WAIT_SEC):
+    def fake_fetch(spot, pairs, *, initial_wait_sec=engine_module._TICKER_INITIAL_WAIT_SEC,
+                   allow_partial=False):
         waits.append(initial_wait_sec)
         return {"AAA_USDT": 1.5}
     monkeypatch.setattr(predictive_module, "_fetch_tickers_cached", fake_fetch)
@@ -120,5 +125,5 @@ def test_predictive_resume_warms_next_tick(monkeypatch):
 
     engine.tick()
     engine.tick()
-    assert waits == [engine_module._TICKER_BOOTSTRAP_WAIT_SEC,
+    assert waits == [predictive_module._PREDICTIVE_TICKER_WARM_WAIT_SEC,
                      engine_module._TICKER_INITIAL_WAIT_SEC]

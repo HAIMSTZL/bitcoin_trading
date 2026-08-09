@@ -10,7 +10,7 @@
 
 启动后访问 http://127.0.0.1:8000 查看实时面板，点击"开始"正式交易，Ctrl+C 停止。
 
-日志：控制台 + log/ 目录（按日期滚动，如 log/trading.log.2026-08-04）。
+日志：控制台 + log/ 目录（按天分文件，如 log/trading_2026-08-09.log）。
 每行日志包含：时间、级别、源文件、代码行号。
 """
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from logging.handlers import TimedRotatingFileHandler
+import time
 
 sys.path.insert(0, ".")  # 允许从项目根目录直接运行
 
@@ -31,17 +31,57 @@ from trading.web.app import app  # noqa: E402
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
 
 
+class DailyFileHandler(logging.FileHandler):
+    """按天分文件写日志：log/trading_YYYY-MM-DD.log。
+
+    每次写日志前检查日期，跨天自动切换到新文件（当天的日志就在以当天
+    日期命名的文件里，不再有"活动文件 + 历史后缀"两套命名）；每天最多
+    清理一次超过 keep_days 的旧文件。
+    """
+
+    def __init__(self, log_dir: str, prefix: str = "trading", keep_days: int = 30):
+        self._log_dir = log_dir
+        self._prefix = prefix
+        self._keep_days = keep_days
+        self._day = time.strftime("%Y-%m-%d")
+        super().__init__(self._path_for(self._day), encoding="utf-8")
+
+    def _path_for(self, day: str) -> str:
+        return os.path.join(self._log_dir, f"{self._prefix}_{day}.log")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        day = time.strftime("%Y-%m-%d")
+        if day != self._day:
+            with self.lock:
+                self._day = day
+                if self.stream:
+                    self.stream.close()
+                self.baseFilename = self._path_for(day)
+                self.stream = self._open()
+                self._purge_old()
+        super().emit(record)
+
+    def _purge_old(self) -> None:
+        cutoff = time.time() - self._keep_days * 86400
+        for name in os.listdir(self._log_dir):
+            if not (name.startswith(f"{self._prefix}_") and name.endswith(".log")):
+                continue
+            path = os.path.join(self._log_dir, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+
+
 def setup_logging() -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
     # 时间 | 级别 | 文件:代码行 | 模块 | 内容
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(filename)s:%(lineno)d | %(name)s | %(message)s"
     )
-    # 每天 0 点滚动，历史文件自动以日期后缀保存（trading.log.2026-08-04），保留 30 天
-    file_handler = TimedRotatingFileHandler(
-        os.path.join(LOG_DIR, "trading.log"),
-        when="midnight", backupCount=30, encoding="utf-8",
-    )
+    # 按天分文件：log/trading_2026-08-09.log，跨天自动切换，保留 30 天
+    file_handler = DailyFileHandler(LOG_DIR)
     file_handler.setFormatter(fmt)
     console = logging.StreamHandler()
     console.setFormatter(fmt)

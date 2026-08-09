@@ -1,6 +1,6 @@
-"""DOGE 趋势恢复策略的独立前向模拟引擎。
+"""低吸先锋策略的独立前向模拟引擎。
 
-该引擎只做 ``DOGE_USDT`` 的 paper long/flat 模拟，和网格及实盘执行器完全隔离。
+该引擎只做 BTC、ETH、DOGE 单币的 paper long/flat 模拟，和网格及实盘执行器完全隔离。
 回测用“下一根开盘”作为可复现的代理；前向模拟则在发现新的已收盘 1h K 线后，
 以当时读取到的 ticker 加保守滑点成交，并把两种时间点完整写入审计事件。
 """
@@ -30,7 +30,7 @@ _CANDLE_SECONDS = 60 * 60
 
 
 class DogeTrendPaperEngine:
-    """DOGE 的低频 staged long/flat 前向模拟。
+    """低吸先锋的低频 staged long/flat 前向模拟。
 
     只有超卖时才试探半仓；试探仓确认恢复后才提高到满仓。任何现货成交均是
     虚拟成交，且构造函数不会请求网络，避免首次下载历史数据阻塞 Web 服务。
@@ -38,15 +38,18 @@ class DogeTrendPaperEngine:
 
     def __init__(self, profile) -> None:
         if config.TRADING_MODE != "paper":
-            raise RuntimeError("DOGE 趋势恢复策略仅支持模拟盘，禁止接入实盘模式")
+            raise RuntimeError("低吸先锋策略仅支持模拟盘，禁止接入实盘模式")
         if profile.kind != "doge_trend":
             raise ValueError("DogeTrendPaperEngine 只能使用 doge_trend Profile")
-        if tuple(profile.pairs) != ("DOGE_USDT",):
-            raise ValueError("DOGE 趋势恢复策略仅允许 DOGE_USDT")
+        if len(profile.pairs) != 1 or profile.pairs[0] not in (
+            "BTC_USDT", "ETH_USDT", "DOGE_USDT",
+        ):
+            raise ValueError("低吸先锋仅允许单币 BTC_USDT、ETH_USDT 或 DOGE_USDT")
 
         self.profile = profile
         self.mode = "paper"
-        self.pair = "DOGE_USDT"
+        self.pair = profile.pairs[0]
+        self.asset = self.pair.split("_", 1)[0]
         self.pairs = [self.pair]
         self.settings = DogeTrendSettings(
             pair=self.pair,
@@ -99,7 +102,12 @@ class DogeTrendPaperEngine:
         self._price_observed_at: float | None = None
         self._last_snapshot = 0.0
         self._last_health = 0.0
-        self._cache_path = Path(config.DOGE_TREND_CACHE_PATH)
+        # 保留 DOGE 原有缓存路径，BTC/ETH 用各自独立缓存，避免互相覆盖。
+        self._cache_path = (
+            Path(config.DOGE_TREND_CACHE_PATH)
+            if profile.name == "doge_trend"
+            else Path(config.DATA_DIR) / f"{profile.name}_1h_cache.json"
+        )
         self._ready = threading.Event()
         self._initializing = True
         self._init_error: str | None = None
@@ -118,7 +126,7 @@ class DogeTrendPaperEngine:
         # 与其他策略保持一致：后台只预热，用户在 Web Tab 点击开始后才会交易。
         self._paused.set()
         self._event("INFO", "doge_trend_init",
-                    "DOGE 趋势行情将在后台预热；Web 服务无需等待历史下载")
+                    f"{self.asset} 低吸行情将在后台预热；Web 服务无需等待历史下载")
 
     # ------------------------------------------------------------------
     # 持久化与历史行情
@@ -129,7 +137,7 @@ class DogeTrendPaperEngine:
             self.quote = config.TOTAL_QUOTE_BUDGET
             self._initial_total = self.quote
             self._event("INFO", "lifecycle",
-                        f"DOGE 趋势模拟盘新建：纯 USDT {self.quote:.2f}，等待开始")
+                        f"{self.asset} 低吸模拟盘新建：纯 USDT {self.quote:.2f}，等待开始")
             self._save_state()
             return
         try:
@@ -160,13 +168,13 @@ class DogeTrendPaperEngine:
             self.last_signal_candle_ts = int(saved.get("last_signal_candle_ts", 0))
             self._initial_total = float(saved.get("initial_total", config.TOTAL_QUOTE_BUDGET))
         except (KeyError, TypeError, ValueError) as error:
-            raise RuntimeError(f"DOGE 趋势模拟盘存档无效: {error}") from error
+            raise RuntimeError(f"{self.asset} 低吸模拟盘存档无效: {error}") from error
         if self.base <= 1e-12:
             self.base = self.average_cost = self.position_cost = 0.0
             self.held_bars = 0
             self.waiting_for_recovery = False
         self._event("INFO", "lifecycle",
-                    f"恢复 DOGE 趋势模拟盘：现金 {self.quote:.2f}，持仓 {self.base:.8g} DOGE")
+                    f"恢复 {self.asset} 低吸模拟盘：现金 {self.quote:.2f}，持仓 {self.base:.8g} {self.asset}")
 
     def _save_state(self) -> None:
         self.store.save_bot_state(_STATE_KEY, {
@@ -202,7 +210,7 @@ class DogeTrendPaperEngine:
     def _assert_history_ready(self) -> None:
         required = max(self.settings.rsi_period, self.settings.confirmation_ema_period) + 2
         if len(self.candles) < required:
-            raise RuntimeError(f"DOGE 趋势策略历史 K 线不足：需要 {required} 根，实际 {len(self.candles)} 根")
+            raise RuntimeError(f"{self.asset} 低吸策略历史 K 线不足：需要 {required} 根，实际 {len(self.candles)} 根")
 
     def _update_indicators(self) -> None:
         if not self.candles:
@@ -225,7 +233,7 @@ class DogeTrendPaperEngine:
                     f"{config.DOGE_TREND_MAX_CANDLE_LAG_SEC / 3600:.2f}h 阈值"
                 )
                 self._event("ERROR", "doge_trend_decision_paused",
-                            f"DOGE 新建仓/加仓已暂停：{self._decision_pause_reason}",
+                            f"{self.asset} 新建仓/加仓已暂停：{self._decision_pause_reason}",
                             detail={"latest_candle_ts": latest.ts, "lag_seconds": lag,
                                     "max_lag_seconds": config.DOGE_TREND_MAX_CANDLE_LAG_SEC})
             return
@@ -233,7 +241,7 @@ class DogeTrendPaperEngine:
             previous = self._decision_pause_reason
             self._decision_pause_reason = None
             self._event("INFO", "doge_trend_decision_resumed",
-                        "DOGE K 线已恢复新鲜，重新允许新建仓和加仓",
+                        f"{self.asset} K 线已恢复新鲜，重新允许新建仓和加仓",
                         detail={"previous_reason": previous, "latest_candle_ts": latest.ts,
                                 "lag_seconds": lag})
 
@@ -250,10 +258,10 @@ class DogeTrendPaperEngine:
         except Exception as error:
             self.candles = []
             self._event("WARNING", "doge_trend_cache_invalid",
-                        f"DOGE K 线缓存不可用，将后台重新下载：{type(error).__name__}: {error}")
+                        f"{self.asset} K 线缓存不可用，将后台重新下载：{type(error).__name__}: {error}")
             return
         self._event("INFO", "doge_trend_cache",
-                    f"已从本地缓存恢复 {len(self.candles)} 根 DOGE 1h 已收盘 K 线",
+                    f"已从本地缓存恢复 {len(self.candles)} 根 {self.asset} 1h 已收盘 K 线",
                     detail={"path": str(self._cache_path), "candles": len(self.candles),
                             "latest_ts": self.candles[-1].ts})
 
@@ -262,7 +270,7 @@ class DogeTrendPaperEngine:
             save_market_snapshot(self._cache_path, {self.pair: self.candles})
         except Exception as error:
             self._event("WARNING", "doge_trend_cache_error",
-                        f"DOGE K 线缓存保存失败：{type(error).__name__}: {error}")
+                        f"{self.asset} K 线缓存保存失败：{type(error).__name__}: {error}")
 
     def _load_initial_history(self) -> None:
         now = time.time()
@@ -275,14 +283,14 @@ class DogeTrendPaperEngine:
         self._update_decision_freshness()
         self._save_history_cache()
         self._event("INFO", "doge_trend_history",
-                    f"已读取 {len(self.candles)} 根 DOGE 1h 已收盘 K 线",
+                    f"已读取 {len(self.candles)} 根 {self.asset} 1h 已收盘 K 线",
                     detail={"candles": len(self.candles), "latest_ts": self.candles[-1].ts,
                             "source": "full_download"})
 
     def _refresh_history(self, *, force: bool = False) -> bool:
         """合并末尾 K 线；失败时保留旧序列，避免一次网络抖动停掉止盈止损。"""
         if not self.candles:
-            raise RuntimeError("DOGE 趋势 K 线尚未初始化")
+            raise RuntimeError(f"{self.asset} 低吸 K 线尚未初始化")
         now = time.time()
         if not force and now - self._last_history_refresh < config.DOGE_TREND_KLINE_REFRESH_SEC:
             self._update_decision_freshness()
@@ -296,7 +304,7 @@ class DogeTrendPaperEngine:
             self._last_history_refresh = now
             self._update_decision_freshness()
             self._event("WARNING", "doge_trend_history_partial",
-                        f"DOGE K 线刷新失败；保留旧数据并等待下次刷新：{type(error).__name__}: {error}",
+                        f"{self.asset} K 线刷新失败；保留旧数据并等待下次刷新：{type(error).__name__}: {error}",
                         pair=self.pair, detail={"latest_ts": old_latest})
             return False
         self.candles = self._normalise_candles(self.candles + update, now)
@@ -308,7 +316,7 @@ class DogeTrendPaperEngine:
         if changed:
             self._save_history_cache()
             self._event("INFO", "doge_trend_history",
-                        "DOGE 已合并新的已收盘 1h K 线",
+                        f"{self.asset} 已合并新的已收盘 1h K 线",
                         pair=self.pair, detail={"latest_ts": self.candles[-1].ts})
         return changed
 
@@ -323,7 +331,7 @@ class DogeTrendPaperEngine:
         )
         price = self.prices.get(self.pair, 0.0)
         if price <= 0:
-            raise RuntimeError("未获取到 DOGE_USDT 行情")
+            raise RuntimeError(f"未获取到 {self.pair} 行情")
         self._price_observed_at = time.time()
 
         # 停机期间不伪造“早该成交”的历史交易。保留已持有仓位，但把 K 线观察点
@@ -334,7 +342,7 @@ class DogeTrendPaperEngine:
             if self.base > 0:
                 self.held_bars += max(0, missed)
             self._event("WARNING", "doge_trend_resume_gap",
-                        f"DOGE 策略离线期间跨过 {missed} 根 K 线；不补造历史信号",
+                        f"{self.asset} 策略离线期间跨过 {missed} 根 K 线；不补造历史信号",
                         detail={"previous_ts": self.last_processed_candle_ts,
                                 "latest_ts": latest_ts, "missed_bars": missed})
         if self.pending_target is not None:
@@ -346,7 +354,7 @@ class DogeTrendPaperEngine:
         self._ready.set()
         self._initializing = False
         self._init_error = None
-        self._event("INFO", "doge_trend_ready", "DOGE 趋势行情预热完成，可开始前向模拟",
+        self._event("INFO", "doge_trend_ready", f"{self.asset} 低吸行情预热完成，可开始前向模拟",
                     detail={"cache_path": str(self._cache_path), "latest_candle_ts": latest_ts,
                             "ticker_observed_at": self._price_observed_at})
 
@@ -368,14 +376,14 @@ class DogeTrendPaperEngine:
         }
         self._event(
             "INFO", "doge_trend_fill",
-            f"DOGE 趋势模拟{side}（{reason_labels.get(fill.get('reason'), fill.get('reason', ''))}）: "
+            f"{self.asset} 低吸模拟{side}（{reason_labels.get(fill.get('reason'), fill.get('reason', ''))}）: "
             f"@ {fill['price']:.8g} 数量 {fill['amount']:.8g} 金额 {fill['quote']:.4f}U，"
             f"利润 {fill['profit']:.4f}U",
             pair=self.pair, detail=fill,
         )
 
     def _buy_to_target(self, target: float, mid: float, audit: dict) -> bool:
-        """把 DOGE 提高到目标权益权重；目标仅允许 50% 或 100%。"""
+        """把单币仓位提高到目标权益权重；目标仅允许 50% 或 100%。"""
         if target <= 0 or target > 1 or mid <= 0:
             return False
         equity = self.quote + self.base * mid
@@ -503,7 +511,7 @@ class DogeTrendPaperEngine:
                     and rsi[-1] >= self.settings.rsi_threshold):
                 self.rsi_rearmed = True
                 self._event("INFO", "doge_trend_rearmed",
-                            "DOGE RSI 已回到阈值上方，策略重新允许未来超卖试探",
+                            f"{self.asset} RSI 已回到阈值上方，策略重新允许未来超卖试探",
                             pair=self.pair,
                             detail={"candle_ts": latest.ts, "rsi_20": rsi[-1],
                                     "threshold": self.settings.rsi_threshold})
@@ -528,8 +536,8 @@ class DogeTrendPaperEngine:
         self.pending_target = target
         self._event(
             "INFO", "doge_trend_signal",
-            ("DOGE RSI 超卖，准备试探 50% 仓位" if reason == "oversold_entry"
-             else "DOGE EMA 上穿确认且高于成本，准备加仓至 100%"),
+            (f"{self.asset} RSI 超卖，准备试探 50% 仓位" if reason == "oversold_entry"
+             else f"{self.asset} EMA 上穿确认且高于成本，准备加仓至 100%"),
             pair=self.pair,
             detail={"signal_candle_ts": latest.ts, "signal_close": latest.close,
                     "rsi_20": rsi[-1], "ema_6": ema[-1], "average_cost": self.average_cost,
@@ -568,7 +576,7 @@ class DogeTrendPaperEngine:
         self._price_observed_at = time.time()
         mid = self.prices.get(self.pair, 0.0)
         if mid <= 0:
-            raise RuntimeError("DOGE_USDT 无可用 ticker 价格")
+            raise RuntimeError(f"{self.pair} 无可用 ticker 价格")
         new_candle = self._observe_new_candle()
         self._maybe_exit(mid)
         if new_candle:
@@ -587,16 +595,16 @@ class DogeTrendPaperEngine:
         if now - self._last_health < config.HEALTH_INTERVAL:
             return
         self._last_health = now
-        message = (f"DOGE 趋势策略正常：权益 {self._equity():.2f}U，"
+        message = (f"{self.asset} 低吸策略正常：权益 {self._equity():.2f}U，"
                    f"仓位 {self.base * self.prices.get(self.pair, 0.0):.2f}U，"
                    f"成交 {self.trade_count} 笔")
         log.info(message)
         self._event("INFO", "health", message)
 
     def run(self) -> None:
-        log.info("DOGE 趋势模拟引擎启动：轮询 %ss，K 线刷新 %ss",
+        log.info("%s 低吸模拟引擎启动：轮询 %ss，K 线刷新 %ss", self.asset,
                  config.TICK_INTERVAL, config.DOGE_TREND_KLINE_REFRESH_SEC)
-        self._event("INFO", "lifecycle", "DOGE 趋势模拟引擎线程启动")
+        self._event("INFO", "lifecycle", f"{self.asset} 低吸模拟引擎线程启动")
         while not self._stop.is_set():
             if not self._ready.is_set():
                 if time.time() < self._next_init_attempt:
@@ -609,10 +617,10 @@ class DogeTrendPaperEngine:
                     self._init_error = f"{type(error).__name__}: {error}"
                     self.last_error = self._init_error
                     self._next_init_attempt = time.time() + config.DOGE_TREND_INIT_RETRY_SEC
-                    log.exception("DOGE 趋势策略行情预热失败，将在 %.0f 秒后重试",
-                                  config.DOGE_TREND_INIT_RETRY_SEC)
+                    log.exception("%s 低吸策略行情预热失败，将在 %.0f 秒后重试",
+                                  self.asset, config.DOGE_TREND_INIT_RETRY_SEC)
                     self._event("ERROR", "doge_trend_init_error",
-                                f"DOGE 趋势行情预热失败，将自动重试：{self._init_error}",
+                                f"{self.asset} 低吸行情预热失败，将自动重试：{self._init_error}",
                                 detail={"traceback": traceback.format_exc(),
                                         "retry_after_sec": config.DOGE_TREND_INIT_RETRY_SEC})
                 continue
@@ -626,28 +634,30 @@ class DogeTrendPaperEngine:
                 self._last_success = time.time()
                 if self._api_outage:
                     self._api_outage = False
-                    self._event("INFO", "api_recovered", "DOGE 趋势策略 API 已恢复")
+                    self._event("INFO", "api_recovered", f"{self.asset} 低吸策略 API 已恢复")
             except Exception as error:
                 self.last_error = f"{type(error).__name__}: {error}"
-                log.exception("DOGE 趋势策略 tick 失败")
+                log.exception("%s 低吸策略 tick 失败", self.asset)
                 self._event("ERROR", "tick_error", self.last_error,
                             detail={"traceback": traceback.format_exc()})
                 if (self._last_success and time.time() - self._last_success
                         > config.API_OUTAGE_ALERT_SEC and not self._api_outage):
                     self._api_outage = True
                     self._event("ERROR", "api_outage",
-                                f"DOGE 趋势策略 API 持续中断：{self.last_error}")
+                                f"{self.asset} 低吸策略 API 持续中断：{self.last_error}")
             self._stop.wait(config.TICK_INTERVAL)
 
     def start_background(self) -> None:
-        self._thread = threading.Thread(target=self.run, daemon=True, name="doge-trend-paper-engine")
+        self._thread = threading.Thread(
+            target=self.run, daemon=True, name=f"{self.profile.name}-paper-engine",
+        )
         self._thread.start()
 
     def pause(self) -> str:
         if self._stopped:
             return "stopped"
         self._paused.set()
-        self._event("INFO", "control", "用户暂停 DOGE 趋势模拟策略")
+        self._event("INFO", "control", f"用户暂停 {self.asset} 低吸模拟策略")
         return "paused"
 
     def reset_paper(self, budget: float) -> str:
@@ -677,9 +687,9 @@ class DogeTrendPaperEngine:
             self.store.clear_trades()
             self.store.clear_equity_snapshots()
             self._save_state()
-        log.warning("DOGE 趋势模拟盘仓位已重置: %.2f USDT", budget)
+        log.warning("%s 低吸模拟盘仓位已重置: %.2f USDT", self.asset, budget)
         self._event("WARNING", "paper_reset",
-                    f"DOGE 趋势模拟盘已重置为 {budget:.2f} USDT，等待开始指令",
+                    f"{self.asset} 低吸模拟盘已重置为 {budget:.2f} USDT，等待开始指令",
                     detail={"budget": budget})
         return self.run_status
 
@@ -688,7 +698,7 @@ class DogeTrendPaperEngine:
             return "stopped"
         self._paused.clear()
         self._warm_next_tick = True
-        self._event("INFO", "control", "用户开始/恢复 DOGE 趋势模拟策略")
+        self._event("INFO", "control", f"用户开始/恢复 {self.asset} 低吸模拟策略")
         return self.run_status
 
     def start(self) -> str:
@@ -698,7 +708,7 @@ class DogeTrendPaperEngine:
             self._stopped = False
             self._warm_next_tick = True
             self.start_background()
-            self._event("INFO", "control", "用户重新启动 DOGE 趋势模拟策略")
+            self._event("INFO", "control", f"用户重新启动 {self.asset} 低吸模拟策略")
             return self.run_status
         return self.resume()
 
@@ -709,14 +719,23 @@ class DogeTrendPaperEngine:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         self._stopped = True
-        self._event("INFO", "control", "用户停止 DOGE 趋势模拟策略")
+        self._event("INFO", "control", f"用户停止 {self.asset} 低吸模拟策略")
         return "stopped"
 
     def stop(self) -> None:
-        self._save_state()
+        """进程退出收尾：先停决策线程，再做最终状态落盘，最后关闭存储。"""
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        if self._tick_lock.acquire(timeout=5):
+            try:
+                self._save_state()
+            except Exception:
+                log.exception("停止时状态落盘失败")
+            finally:
+                self._tick_lock.release()
+        else:
+            log.warning("停止时未能取得 tick 锁，跳过最终落盘（以上一 tick 状态为准）")
         self.store.close()
         self.client.close()
 
@@ -735,7 +754,7 @@ class DogeTrendPaperEngine:
         try:
             self.store.record_event(level, type, message, pair, detail)
         except Exception:
-            log.exception("DOGE 趋势策略事件落库失败: %s", type)
+            log.exception("%s 低吸策略事件落库失败: %s", self.asset, type)
 
     def state(self) -> dict[str, Any]:
         price = self.prices.get(self.pair, 0.0)
@@ -778,6 +797,7 @@ class DogeTrendPaperEngine:
             "total_realized_profit": self.realized_profit, "total_fees": self.total_fees,
             "pairs": rows, "indicators": {}, "signal_filter": False,
             "doge_trend": {
+                "pair": self.pair, "asset": self.asset,
                 "ready": self._ready.is_set(), "initializing": self._initializing,
                 "init_error": self._init_error, "cache_path": str(self._cache_path),
                 "rsi_20": self.latest_rsi, "ema_6": self.latest_ema,

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import time
 
 from trading import config
 from trading.backtest import Candle
@@ -123,3 +124,51 @@ def test_stale_common_candle_pauses_and_then_resumes_decisions(monkeypatch):
     engine._update_decision_freshness()
     assert engine._decision_pause_reason is None
     assert any(args[1] == "predictive_decision_resumed" for args, _ in events)
+
+
+def test_predictive_tick_skips_partial_tickers_without_overwriting_complete_prices(monkeypatch):
+    """单个 ticker 缺失时不应把组合估值变成半帧，更不能进入 tick_error。"""
+    engine = PredictivePaperEngine.__new__(PredictivePaperEngine)
+    engine.pairs = ["AAA_USDT", "BBB_USDT"]
+    engine.prices = {"AAA_USDT": 10.0, "BBB_USDT": 20.0}
+    engine._warm_next_tick = False
+    engine._price_partial_missing = ()
+    engine._price_partial_since = None
+    engine._last_price_partial_event = 0.0
+    engine.last_error = None
+    engine.last_tick = None
+    engine._refresh_history = lambda: None
+    engine._save_state = lambda: None
+    engine._maybe_health_check = lambda: None
+    engine._last_snapshot = time.time()
+    engine.base = {"AAA_USDT": 0.0, "BBB_USDT": 0.0}
+    engine.realized_profit = {"AAA_USDT": 0.0, "BBB_USDT": 0.0}
+    engine.quote = 100.0
+    events = []
+    engine._event = lambda *args, **kwargs: events.append((args, kwargs))
+    decisions = []
+    engine._maybe_decide = lambda: decisions.append(True)
+
+    monkeypatch.setattr(
+        "trading.predictive_engine._fetch_tickers_cached",
+        lambda *args, **kwargs: {"AAA_USDT": 11.0},
+    )
+
+    assert engine.tick() is False
+    assert engine.prices == {"AAA_USDT": 10.0, "BBB_USDT": 20.0}
+    assert engine._price_partial_missing == ("BBB_USDT",)
+    assert "已跳过本轮预测调仓" in engine.last_error
+    assert decisions == []
+    assert any(args[1] == "predictive_price_partial" for args, _ in events)
+
+    monkeypatch.setattr(
+        "trading.predictive_engine._fetch_tickers_cached",
+        lambda *args, **kwargs: {"AAA_USDT": 11.0, "BBB_USDT": 21.0},
+    )
+
+    assert engine.tick() is True
+    assert engine.prices == {"AAA_USDT": 11.0, "BBB_USDT": 21.0}
+    assert engine._price_partial_missing == ()
+    assert engine.last_error is None
+    assert decisions == [True]
+    assert any(args[1] == "predictive_price_recovered" for args, _ in events)

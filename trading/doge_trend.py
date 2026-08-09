@@ -1,6 +1,6 @@
-"""DOGE 专用的低频趋势恢复策略及可复现回测。
+"""低吸先锋的低频趋势恢复策略及可复现回测。
 
-策略只交易 ``DOGE_USDT``，始终为 long/flat：RSI-20 超卖时先以小仓试探；
+策略可用于 BTC、ETH、DOGE 的单币 long/flat 模拟：RSI-20 超卖时先以小仓试探；
 只有价格重新上穿短 EMA、且已高于持仓成本时，才把仓位加至满仓。退出由固定
 获利目标、硬止损和最长持仓时间共同约束。所有收盘信号均在下一根 K 线开盘成交，
 K 线内止盈/止损按方向性 OHLC 路径处理，不使用未来数据。
@@ -38,7 +38,7 @@ class OhlcCandle(Protocol):
 
 @dataclass(frozen=True)
 class DogeTrendSettings:
-    """DOGE 趋势恢复候选的参数。
+    """低吸先锋候选的参数（类名保留以兼容既有研究/回测入口）。
 
     ``initial_fraction`` 是超卖时的试探仓位。短 EMA 恢复向上且价格高于平均成本时，
     策略会在下一根开盘加到 100%，因此允许但不盲目 all-in。
@@ -112,8 +112,8 @@ class DogeWalkForwardResult:
 
 
 def _validate(settings: DogeTrendSettings) -> None:
-    if settings.pair != "DOGE_USDT":
-        raise ValueError("DogeTrendStrategy 仅允许 DOGE_USDT")
+    if settings.pair not in ("BTC_USDT", "ETH_USDT", "DOGE_USDT"):
+        raise ValueError("低吸先锋仅允许 BTC_USDT、ETH_USDT 或 DOGE_USDT")
     if settings.total_quote_budget <= 0 or settings.fee_rate < 0:
         raise ValueError("预算必须为正，手续费不能为负")
     if settings.slippage_bps < 0:
