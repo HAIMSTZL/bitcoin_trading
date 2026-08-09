@@ -359,7 +359,7 @@ class DogeTrendPaperEngine:
     def _record_fill(self, fill: dict) -> None:
         self.store.record_trade(
             self.mode, self.pair, fill["side"], fill["price"], fill["amount"],
-            fill["quote"], fill["profit"],
+            fill["quote"], fill["profit"], fill.get("fee", 0.0),
         )
         side = "买入" if fill["side"] == "buy" else "卖出"
         reason_labels = {

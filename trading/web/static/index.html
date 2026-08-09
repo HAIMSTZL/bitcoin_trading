@@ -360,7 +360,7 @@
   <span class="chip" id="chipMode">…</span>
   <span class="chip"><span class="dot running" id="runDot"></span><b id="runText">…</b></span>
   <span class="chip">权益 <b class="mono-num" id="chipEquity">-</b></span>
-  <span class="chip">已实现 <b class="mono-num" id="chipRealized">-</b></span>
+  <span class="chip">全周期已实现 <b class="mono-num" id="chipRealized">-</b></span>
   <span class="spacer"></span>
   <button class="btn" onclick="toggleSettings()">⚙ 参数</button>
   <button class="btn start" id="btnStart" onclick="control('start')">▶ 开始</button>
@@ -411,12 +411,12 @@
     <div class="panel-body">
       <div class="sub-line">总权益 (USDT)</div>
       <div class="big-num mono-num" id="wEquity">-</div>
-      <div class="sub-line">初始权益 <b class="mono-num" id="wInit">-</b> · 浮动盈亏 <b class="mono-num" id="wPnl">-</b></div>
+      <div class="sub-line">初始权益 <b class="mono-num" id="wInit">-</b> · 总盈亏 <b class="mono-num" id="wPnl">-</b></div>
       <canvas id="wSpark" style="width:100%;height:44px"></canvas>
       <div class="stat-grid">
-        <div class="cell"><div class="k">已实现利润</div><div class="v mono-num" id="wRealized">-</div></div>
-        <div class="cell"><div class="k">成交笔数</div><div class="v mono-num" id="wTrades">-</div></div>
-        <div class="cell"><div class="k">当前挂单</div><div class="v mono-num" id="wOrders">-</div></div>
+        <div class="cell"><div class="k">全周期已实现</div><div class="v mono-num" id="wRealized">-</div></div>
+        <div class="cell"><div class="k">浮动盈亏</div><div class="v mono-num" id="wUnrealized">-</div></div>
+        <div class="cell"><div class="k">累计成交</div><div class="v mono-num" id="wTrades">-</div></div>
         <div class="cell"><div class="k">累计手续费</div><div class="v mono-num" id="wFees">-</div></div>
       </div>
     </div>
@@ -912,7 +912,7 @@ function render(s) {
     return `${d.pair.replace('_', '/')} <b class="mono-num">${fmtPrice(d.price)}</b> <span class="${signCls(chg || 0)}">${chgTxt}</span>`;
   }).join('&nbsp;&nbsp;·&nbsp;&nbsp;');
   $('ticker').innerHTML = `<span class="lbl">LIVE FEED</span>&nbsp;&nbsp;${tick}` +
-    `&nbsp;&nbsp;·&nbsp;&nbsp;权益 <b>${fmt(s.total_equity, 2)}U</b>&nbsp;&nbsp;·&nbsp;&nbsp;已实现 <b>${fmt(s.total_realized_profit, 4)}</b>` +
+    `&nbsp;&nbsp;·&nbsp;&nbsp;权益 <b>${fmt(s.total_equity, 2)}U</b>&nbsp;&nbsp;·&nbsp;&nbsp;全周期已实现 <b>${fmt(s.total_realized_profit, 4)}</b>` +
     `&nbsp;&nbsp;·&nbsp;&nbsp;状态 ${STATUS_TEXT[rs]}&nbsp;&nbsp;·&nbsp;&nbsp;`.repeat(2) + tick;
 
   /* 账户总览 */
@@ -926,8 +926,10 @@ function render(s) {
   wp.className = 'mono-num ' + signCls(totalPnl);
   $('wRealized').textContent = fmt(s.total_realized_profit, 4);
   $('wRealized').className = 'v mono-num ' + signCls(s.total_realized_profit);
-  $('wTrades').textContent = Object.values(s.pairs).reduce((a, p) => a + p.trade_count, 0);
-  $('wOrders').textContent = Object.values(s.pairs).reduce((a, p) => a + p.orders.length, 0);
+  const unrealizedPnl = s.total_unrealized_profit ?? (totalPnl - s.total_realized_profit);
+  $('wUnrealized').textContent = (unrealizedPnl >= 0 ? '+' : '') + fmt(unrealizedPnl, 4);
+  $('wUnrealized').className = 'v mono-num ' + signCls(unrealizedPnl);
+  $('wTrades').textContent = s.total_trade_count ?? Object.values(s.pairs).reduce((a, p) => a + p.trade_count, 0);
   $('wFees').textContent = fmt(s.total_fees || 0, 4);
   drawSpark($('wSpark'), eqHist.map(p => p.equity), '#1a7f37', true);
 

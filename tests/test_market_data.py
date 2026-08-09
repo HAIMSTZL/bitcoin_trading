@@ -178,3 +178,46 @@ def test_grid_engine_initialization_can_complete_after_web_is_available():
     assert engine._init_error is None
     assert engine._initial_total == 10.0
     assert writes == [("initial_equity", "10.0")]
+
+
+def test_grid_state_uses_full_trade_ledger_after_slot_rotation(tmp_path):
+    """当前 bots 不再包含已被轮换淘汰的币对，账户总账仍必须包含其损益。"""
+    store = engine_module.Store(str(tmp_path / "rotation.db"))
+    store.record_trade("paper", "RETIRED_USDT", "sell", 10.0, 1.0, 9.8, -1.0, 0.2)
+    store.record_trade("paper", "CURRENT_USDT", "sell", 10.0, 1.0, 9.9, 0.3, 0.1)
+
+    bot = SimpleNamespace(state=lambda price, account: {
+        "equity": 299.0, "realized_profit": 0.3, "total_fees": 0.1,
+        "trade_count": 1, "orders": [],
+    }, start_price=10.0)
+    engine = engine_module.Engine.__new__(engine_module.Engine)
+    engine.mode = "paper"
+    engine.bots = {"CURRENT_USDT": bot}
+    engine.prices = {"CURRENT_USDT": 10.0}
+    engine.account = object()
+    engine._initial_total = 300.0
+    engine.profile = SimpleNamespace(name="rotation", label="筛选轮换", use_signal_filter=True)
+    engine._stopped = False
+    engine._ready = threading.Event()
+    engine._ready.set()
+    engine._paused = threading.Event()
+    engine._init_error = None
+    engine._cb_global = False
+    engine._cb_pairs = {}
+    engine._api_outage = False
+    engine._last_success = None
+    engine.started_at = 0.0
+    engine.last_tick = None
+    engine.last_error = None
+    engine.pairs = ["CURRENT_USDT"]
+    engine.indicators = SimpleNamespace(get=lambda pair: {})
+    engine.store = store
+
+    state = engine.state()
+
+    assert state["total_pnl"] == pytest.approx(-1.0)
+    assert state["total_realized_profit"] == pytest.approx(-0.7)
+    assert state["total_unrealized_profit"] == pytest.approx(-0.3)
+    assert state["total_fees"] == pytest.approx(0.3)
+    assert state["total_trade_count"] == 2
+    store.close()

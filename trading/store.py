@@ -33,7 +33,8 @@ class Store:
                     price   REAL NOT NULL,
                     amount  REAL NOT NULL,
                     quote   REAL NOT NULL,
-                    profit  REAL NOT NULL DEFAULT 0
+                    profit  REAL NOT NULL DEFAULT 0,
+                    fee     REAL NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS equity_snapshots (
                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +63,24 @@ class Store:
                 );
                 """
             )
+            # 旧库没有逐笔手续费字段。网格成交的 quote 是买入总支出或卖出净收入，
+            # 因此 |price * amount - quote| 可无损还原该笔手续费；新成交直接落原始 fee。
+            columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(trades)")
+            }
+            if "fee" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE trades ADD COLUMN fee REAL NOT NULL DEFAULT 0"
+                )
+                self._conn.execute(
+                    "UPDATE trades SET fee=ABS(price * amount - quote) WHERE fee=0"
+                )
+                # 历史权益曲线同样曾写入“当前在场币对”的局部利润；按成交时间重算，
+                # 让曲线与新的全周期口径连续可审计。
+                self._conn.execute(
+                    "UPDATE equity_snapshots AS snapshots SET realized=COALESCE("
+                    "(SELECT SUM(trades.profit) FROM trades WHERE trades.ts <= snapshots.ts), 0)"
+                )
 
     def get_meta(self, key: str) -> Optional[str]:
         with self._lock:
@@ -145,13 +164,27 @@ class Store:
         amount: float,
         quote: float,
         profit: float = 0.0,
+        fee: float = 0.0,
     ) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO trades(ts, mode, pair, side, price, amount, quote, profit)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (time.time(), mode, pair, side, price, amount, quote, profit),
+                "INSERT INTO trades(ts, mode, pair, side, price, amount, quote, profit, fee)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (time.time(), mode, pair, side, price, amount, quote, profit, fee),
             )
+
+    def trade_summary(self) -> dict[str, float | int]:
+        """全周期成交账本汇总；不依赖当前仍在场的策略槽位。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS trade_count, COALESCE(SUM(profit), 0) AS realized_profit, "
+                "COALESCE(SUM(fee), 0) AS total_fees FROM trades"
+            ).fetchone()
+        return {
+            "trade_count": int(row["trade_count"]),
+            "realized_profit": float(row["realized_profit"]),
+            "total_fees": float(row["total_fees"]),
+        }
 
     def record_equity(self, equity: float, realized: float, detail: dict) -> None:
         with self._lock, self._conn:

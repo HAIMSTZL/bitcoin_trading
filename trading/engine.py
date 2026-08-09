@@ -690,7 +690,7 @@ class Engine:
     def _record_fill(self, fill: dict) -> None:
         self.store.record_trade(
             self.mode, fill["pair"], fill["side"], fill["price"],
-            fill["amount"], fill["quote"], fill["profit"],
+            fill["amount"], fill["quote"], fill["profit"], fill.get("fee", 0.0),
         )
         side = "买入" if fill["side"] == "buy" else "卖出"
         sweep = "（清仓扫尾）" if fill.get("sweep") else ""
@@ -1265,6 +1265,11 @@ class Engine:
             pairs[pair] = s
         total_equity = sum(s["equity"] for s in pairs.values())
         total_initial = self._initial_total  # 固定基准（建仓时落库），不受重建/调拨影响
+        # 轮换时旧 bot 会退役，不能再从当前 bots 汇总历史实现盈亏/手续费。
+        # 以不可变成交账本为准，保证重启和换币后仍可与总权益严格对账。
+        trade_summary = self.store.trade_summary()
+        total_realized = trade_summary["realized_profit"]
+        total_pnl = total_equity - total_initial
         return {
             "mode": self.mode,
             "strategy": self.profile.name,
@@ -1283,9 +1288,11 @@ class Engine:
             "last_error": self.last_error,
             "total_equity": total_equity,
             "total_initial_equity": total_initial,
-            "total_pnl": total_equity - total_initial,
-            "total_realized_profit": sum(s["realized_profit"] for s in pairs.values()),
-            "total_fees": sum(s["total_fees"] for s in pairs.values()),
+            "total_pnl": total_pnl,
+            "total_realized_profit": total_realized,
+            "total_unrealized_profit": total_pnl - total_realized,
+            "total_fees": trade_summary["total_fees"],
+            "total_trade_count": trade_summary["trade_count"],
             "pairs": pairs,
             "indicators": {p: self.indicators.get(p) for p in self.pairs},
             "signal_filter": self.profile.use_signal_filter,
