@@ -32,7 +32,7 @@ from .backtest import Candle, fetch_gate_candles, interval_seconds
 # 不按回测期最终表现挑选；这些是长期主流、高流动性现货的预先定义候选池。
 DEFAULT_UNIVERSE = config.PREDICTIVE_PAIRS
 _WARMUP_BARS = 72
-ModelKind = Literal["ridge", "xgboost"]
+ModelKind = Literal["ridge", "xgboost", "dual_momentum", "ema_trend", "bollinger_reversion"]
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,18 @@ class PredictiveSettings:
     # 非零时，BTC 低于该 EMA 时组合强制空仓，作为系统性下跌保护。
     market_ema_period: int = 0
     report_period_bars: int = 24 * 30
+    # 双动量：只在过去 lookback 的收益为正时参与，按收益/近期波动率排序。
+    momentum_lookback_bars: int = 120
+    momentum_volatility_bars: int = 24
+    # EMA 趋势：快线上穿慢线的币参与横截面排序；绝不使用尚未收盘的交叉。
+    trend_fast_ema: int = 12
+    trend_slow_ema: int = 72
+    # 布林回归：仅在长期趋势仍向上时，买入同时满足下轨偏离与 RSI 超卖的币。
+    bollinger_period: int = 30
+    bollinger_stddev: float = 2.0
+    bollinger_rsi_period: int = 14
+    bollinger_rsi_threshold: float = 35.0
+    mean_reversion_trend_ema: int = 100
 
 
 @dataclass(frozen=True)
@@ -318,6 +330,80 @@ def _align(candles_by_pair: dict[str, Sequence[Candle]], pairs: Sequence[str]) -
     }
 
 
+def _simple_rsi_at(closes: np.ndarray, index: int, period: int) -> float | None:
+    """只使用 ``index`` 及以前收盘价计算简单 RSI，避免规则策略偷看未来。"""
+    if index < period:
+        return None
+    changes = np.diff(closes[index - period:index + 1])
+    gains = np.maximum(changes, 0.0)
+    losses = np.maximum(-changes, 0.0)
+    avg_loss = float(losses.mean())
+    if avg_loss <= 1e-12:
+        return 100.0
+    return float(100 - 100 / (1 + gains.mean() / avg_loss))
+
+
+def _rule_scores(
+    candles_by_pair: dict[str, Sequence[Candle]], index: int, settings: PredictiveSettings,
+) -> tuple[dict[str, float], bool]:
+    """返回确定性规则分数与 BTC 风险开关。
+
+    所有输入严格截止到 ``index`` 的已收盘 K 线。正分才代表可持有候选；分数只用于
+    排序而非作为未来收益预测，因此不会伪装成机器学习输出。
+    """
+    if settings.model not in ("dual_momentum", "ema_trend", "bollinger_reversion"):
+        raise ValueError(f"{settings.model!r} 不是规则评分模型")
+    btc = np.asarray([c.close for c in candles_by_pair["BTC_USDT"]], dtype=float)
+    risk_on = True
+    if settings.market_ema_period:
+        risk_on = bool(btc[index] > _ema(btc[:index + 1], settings.market_ema_period)[-1])
+    scores: dict[str, float] = {}
+    for pair in settings.pairs:
+        closes = np.asarray([c.close for c in candles_by_pair[pair]], dtype=float)
+        if settings.model == "dual_momentum":
+            if index < max(settings.momentum_lookback_bars, settings.momentum_volatility_bars):
+                continue
+            momentum = closes[index] / closes[index - settings.momentum_lookback_bars] - 1.0
+            returns = np.diff(np.log(closes[index - settings.momentum_volatility_bars:index + 1]))
+            volatility = float(returns.std())
+            # 负动量明确为不可选；仍保留原始分数，方便 Web 和回测审计。
+            scores[pair] = float(momentum / max(volatility, 1e-9))
+        elif settings.model == "ema_trend":
+            if index < settings.trend_slow_ema:
+                continue
+            fast = _ema(closes[:index + 1], settings.trend_fast_ema)[-1]
+            slow = _ema(closes[:index + 1], settings.trend_slow_ema)[-1]
+            scores[pair] = float(fast / slow - 1.0) if fast > slow else 0.0
+        else:
+            if index < max(settings.bollinger_period, settings.bollinger_rsi_period,
+                           settings.mean_reversion_trend_ema):
+                continue
+            window = closes[index - settings.bollinger_period + 1:index + 1]
+            middle = float(window.mean())
+            deviation = float(window.std())
+            lower = middle - settings.bollinger_stddev * deviation
+            rsi = _simple_rsi_at(closes, index, settings.bollinger_rsi_period)
+            trend = _ema(closes[:index + 1], settings.mean_reversion_trend_ema)[-1]
+            if (deviation > 1e-12 and rsi is not None and closes[index] < lower
+                    and rsi <= settings.bollinger_rsi_threshold and closes[index] > trend):
+                scores[pair] = float((lower - closes[index]) / deviation)
+            else:
+                scores[pair] = 0.0
+    return scores, risk_on
+
+
+def rule_target(
+    candles_by_pair: dict[str, Sequence[Candle]], index: int, settings: PredictiveSettings,
+) -> tuple[tuple[str, ...], dict[str, float], bool]:
+    """规则型策略的目标持仓：risk-off 或无正分候选时保持 USDT。"""
+    scores, risk_on = _rule_scores(candles_by_pair, index, settings)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    target = (() if not risk_on else tuple(
+        pair for pair, score in ranked if score > 0
+    )[:settings.max_positions])
+    return target, scores, risk_on
+
+
 def _validate(settings: PredictiveSettings) -> None:
     if len(settings.pairs) < 2:
         raise ValueError("预测组合至少需要两个预先确定的交易对")
@@ -327,8 +413,8 @@ def _validate(settings: PredictiveSettings) -> None:
         raise ValueError("标签周期至少为 1，训练窗口不能短于特征暖机期")
     if settings.retrain_interval_bars < 1 or settings.rebalance_interval_bars < 1:
         raise ValueError("重训和调仓间隔至少为 1 根 K 线")
-    if settings.model not in ("ridge", "xgboost"):
-        raise ValueError("model 必须是 ridge 或 xgboost")
+    if settings.model not in ("ridge", "xgboost", "dual_momentum", "ema_trend", "bollinger_reversion"):
+        raise ValueError("model 必须是 ridge、xgboost、dual_momentum、ema_trend 或 bollinger_reversion")
     if settings.ridge_alpha < 0 or settings.expected_return_threshold < 0:
         raise ValueError("正则系数和开仓阈值不能为负")
     if (settings.xgb_estimators < 1 or settings.xgb_max_depth < 1
@@ -340,6 +426,15 @@ def _validate(settings: PredictiveSettings) -> None:
         raise ValueError("max_positions 应在 1 到交易对数量之间")
     if settings.market_ema_period < 0 or settings.report_period_bars < 1:
         raise ValueError("EMA 周期不能为负，报告周期至少为 1")
+    if settings.momentum_lookback_bars < 2 or settings.momentum_volatility_bars < 2:
+        raise ValueError("双动量回看窗口至少为 2 根 K 线")
+    if settings.trend_fast_ema < 2 or settings.trend_slow_ema <= settings.trend_fast_ema:
+        raise ValueError("EMA 趋势参数必须满足 2 <= fast < slow")
+    if (settings.bollinger_period < 2 or settings.bollinger_stddev <= 0
+            or settings.bollinger_rsi_period < 2
+            or not 0 < settings.bollinger_rsi_threshold < 100
+            or settings.mean_reversion_trend_ema < 2):
+        raise ValueError("布林回归参数非法")
 
 
 def _training_set(
@@ -435,6 +530,71 @@ def _periods(points: Sequence[tuple[int, float]], bars: int) -> list[OosPeriod]:
     return periods
 
 
+def _run_rule_rotation_backtest(
+    aligned: dict[str, list[Candle]], interval: str, settings: PredictiveSettings,
+) -> PredictiveResult:
+    """无训练、固定规则的多币种 long/flat 回测。
+
+    分数在收盘 ``index`` 生成，统一在 ``index + 1`` 的开盘成交；这和 Ridge 回测
+    保持同一成交口径，避免规则策略因“当根收盘成交”获得不公平优势。
+    """
+    count = len(aligned[settings.pairs[0]])
+    warmup = max(
+        _WARMUP_BARS,
+        settings.market_ema_period,
+        settings.momentum_lookback_bars if settings.model == "dual_momentum" else
+        settings.trend_slow_ema if settings.model == "ema_trend" else
+        max(settings.bollinger_period, settings.bollinger_rsi_period,
+            settings.mean_reversion_trend_ema),
+    )
+    if count < warmup + 2:
+        raise ValueError(f"K 线不足：规则策略至少需要 {warmup + 2} 根，实际只有 {count} 根")
+    quote = settings.total_quote_budget
+    base = {pair: 0.0 for pair in settings.pairs}
+    total_fees = turnover = 0.0
+    trades = rebalances = invested_bars = 0
+    points: list[tuple[int, float]] = [(aligned[settings.pairs[0]][warmup + 1].ts, quote)]
+    for index in range(warmup, count - 1):
+        if (index - warmup) % settings.rebalance_interval_bars == 0:
+            target, _, _ = rule_target(aligned, index, settings)
+            open_prices = {pair: aligned[pair][index + 1].open for pair in settings.pairs}
+            quote, base, fees, gross, count_trades = _rebalance(
+                quote, base, target, open_prices, settings.fee_rate,
+                settings.slippage_bps / 10_000,
+            )
+            total_fees += fees
+            turnover += gross
+            trades += count_trades
+            rebalances += 1
+        closes = {pair: aligned[pair][index + 1].close for pair in settings.pairs}
+        equity = quote + sum(base[pair] * closes[pair] for pair in settings.pairs)
+        points.append((aligned[settings.pairs[0]][index + 1].ts, equity))
+        if any(amount > 1e-14 for amount in base.values()):
+            invested_bars += 1
+    initial_prices = {pair: aligned[pair][warmup + 1].open for pair in settings.pairs}
+    final_prices = {pair: aligned[pair][-1].close for pair in settings.pairs}
+    slippage_rate = settings.slippage_bps / 10_000
+    buy_hold_equity = sum(
+        settings.total_quote_budget / len(settings.pairs) * (1 - settings.fee_rate)
+        / (initial_prices[pair] * (1 + slippage_rate)) * final_prices[pair]
+        for pair in settings.pairs
+    )
+    final_equity = points[-1][1]
+    return PredictiveResult(
+        start_ts=points[0][0], end_ts=points[-1][0], interval=interval,
+        settings=settings, initial_equity=settings.total_quote_budget,
+        final_equity=final_equity,
+        return_pct=(final_equity / settings.total_quote_budget - 1) * 100,
+        buy_hold_equity=buy_hold_equity,
+        buy_hold_return_pct=(buy_hold_equity / settings.total_quote_budget - 1) * 100,
+        max_drawdown_pct=_max_drawdown_pct([value for _, value in points]),
+        total_fees=total_fees, total_turnover=turnover, trade_count=trades,
+        rebalance_count=rebalances, model_refit_count=0,
+        exposure_pct=invested_bars / max(1, len(points) - 1) * 100,
+        periods=_periods(points, settings.report_period_bars),
+    )
+
+
 def run_predictive_backtest(
     candles_by_pair: dict[str, Sequence[Candle]],
     interval: str,
@@ -443,6 +603,8 @@ def run_predictive_backtest(
     """执行无前视、滚动重训的多币种 long/flat 回测。"""
     _validate(settings)
     aligned = _align(candles_by_pair, settings.pairs)
+    if settings.model in ("dual_momentum", "ema_trend", "bollinger_reversion"):
+        return _run_rule_rotation_backtest(aligned, interval, settings)
     count = len(next(iter(aligned.values())))
     required = _WARMUP_BARS + settings.train_bars + settings.horizon_bars + 2
     if count < required:
@@ -563,7 +725,11 @@ def _print_result(result: PredictiveResult) -> None:
         f"ridge(alpha={settings.ridge_alpha:g})" if settings.model == "ridge" else
         "xgboost("
         f"trees={settings.xgb_estimators}, depth={settings.xgb_max_depth}, "
-        f"lr={settings.xgb_learning_rate:g})"
+        f"lr={settings.xgb_learning_rate:g})" if settings.model == "xgboost" else
+        f"双动量({settings.momentum_lookback_bars}h/{settings.momentum_volatility_bars}h)"
+        if settings.model == "dual_momentum" else
+        f"EMA趋势({settings.trend_fast_ema}/{settings.trend_slow_ema})"
+        if settings.model == "ema_trend" else "布林回归"
     )
     print(
         f"阈值 {settings.expected_return_threshold:.2%} | 持仓数 {settings.max_positions} | "
@@ -591,7 +757,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--days", type=int, default=365, help="历史读取天数（1h 最多约 400 天）")
     parser.add_argument("--interval", default="1h", help="Gate K 线周期，例如 1h 或 4h")
     parser.add_argument("--pairs", default=",".join(DEFAULT_UNIVERSE), help="预先确定的、逗号分隔的币池")
-    parser.add_argument("--model", choices=("ridge", "xgboost"), default="ridge")
+    parser.add_argument(
+        "--model", choices=("ridge", "xgboost", "dual_momentum", "ema_trend", "bollinger_reversion"),
+        default="ridge",
+    )
     parser.add_argument("--budget", type=float, default=config.TOTAL_QUOTE_BUDGET)
     parser.add_argument("--train-days", type=float, default=120)
     parser.add_argument("--horizon-hours", type=float, default=12)
@@ -611,6 +780,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         seconds = interval_seconds(args.interval)
         pairs = tuple(pair.strip().upper() for pair in args.pairs.split(",") if pair.strip())
+        # 规则候选的实盘前研究参数锁定在代码中，CLI 复现时不沿用 Ridge 的高频默认值。
+        if args.model == "dual_momentum":
+            args.rebalance_hours, args.max_positions, args.market_ema, args.slippage_bps = 48, 2, 200, 10
+        elif args.model == "ema_trend":
+            args.rebalance_hours, args.max_positions, args.market_ema, args.slippage_bps = 48, 2, 200, 10
         settings = PredictiveSettings(
             pairs=pairs, model=args.model, total_quote_budget=args.budget, slippage_bps=args.slippage_bps,
             train_bars=_bars_from_hours(args.train_days * 24, seconds, "训练天数"),
@@ -621,6 +795,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ridge_alpha=args.ridge_alpha, xgb_estimators=args.xgb_estimators,
             xgb_max_depth=args.xgb_max_depth, xgb_learning_rate=args.xgb_learning_rate,
             market_ema_period=args.market_ema,
+            momentum_lookback_bars=72, momentum_volatility_bars=24,
+            trend_fast_ema=12, trend_slow_ema=72,
         )
         _validate(settings)
     except ValueError as error:

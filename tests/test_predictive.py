@@ -8,10 +8,12 @@ from trading.predictive import (
     RidgeReturnModel,
     _feature_matrix,
     _rebalance,
+    _rule_scores,
     _training_set,
     load_market_snapshot,
     save_market_snapshot,
 )
+from trading.profiles import PROFILES
 
 
 def _candles(count: int, *, future_jump: float = 0.0) -> list[Candle]:
@@ -76,3 +78,29 @@ def test_market_snapshot_round_trip(tmp_path):
     original = {"BTC_USDT": [Candle(1, 1, 2, 0.5, 1.5, volume=7)]}
     save_market_snapshot(path, original)
     assert load_market_snapshot(path, ("BTC_USDT",)) == original
+
+
+def test_rule_profiles_are_separate_paper_research_candidates():
+    assert PROFILES["dual_momentum"].kind == "predictive"
+    assert PROFILES["dual_momentum"].signal_model == "dual_momentum"
+    assert PROFILES["ema_trend"].kind == "predictive"
+    assert PROFILES["ema_trend"].signal_model == "ema_trend"
+
+
+def test_dual_momentum_score_does_not_change_when_only_future_candles_change():
+    plain = _candles(260)
+    changed = list(plain)
+    # 只修改 index=220 之后的未来数据；index=180 的信号绝不能受影响。
+    changed[220] = Candle(220 * 3600, 1, 2, 1, 999, volume=1)
+    settings = PredictiveSettings(
+        pairs=("BTC_USDT", "ETH_USDT"), model="dual_momentum",
+        market_ema_period=50, momentum_lookback_bars=72, momentum_volatility_bars=24,
+    )
+    before, risk_before = _rule_scores(
+        {"BTC_USDT": plain, "ETH_USDT": plain}, 180, settings,
+    )
+    after, risk_after = _rule_scores(
+        {"BTC_USDT": changed, "ETH_USDT": changed}, 180, settings,
+    )
+    assert before == after
+    assert risk_before == risk_after

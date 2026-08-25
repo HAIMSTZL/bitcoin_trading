@@ -612,6 +612,24 @@ const PREDICTIVE_TREE_LABELS = {
   buy: ['调仓买入', '目标增配'], sell: ['调仓卖出', '目标减配'],
   rebuy: ['目标权重', '等权分配'], resell: ['回到 USDT', '风险/低分'], pnl: ['组合权益', ''],
 };
+const DUAL_MOMENTUM_TREE_LABELS = {
+  tick: ['TICK FEED', '3s 轮询'], price: ['读取行情', '10币 ticker'],
+  detect: ['双动量评分', '120h / 波动率'], wait: ['维持仓位', '等待 48h 决策'],
+  buy: ['调仓买入', '强势币入选'], sell: ['调仓卖出', '动量转弱'],
+  rebuy: ['目标权重', '等权 Top 2'], resell: ['回到 USDT', 'BTC risk-off'], pnl: ['组合权益', ''],
+};
+const EMA_TREND_TREE_LABELS = {
+  tick: ['TICK FEED', '3s 轮询'], price: ['读取行情', '10币 ticker'],
+  detect: ['EMA 趋势筛选', '12 / 72 EMA'], wait: ['维持仓位', '等待 48h 决策'],
+  buy: ['调仓买入', '快线高于慢线'], sell: ['调仓卖出', '趋势失效'],
+  rebuy: ['目标权重', '等权 Top 2'], resell: ['回到 USDT', 'BTC risk-off'], pnl: ['组合权益', ''],
+};
+const BOLLINGER_TREE_LABELS = {
+  tick: ['TICK FEED', '3s 轮询'], price: ['读取行情', '10币 ticker'],
+  detect: ['布林回归筛选', '下轨 / RSI'], wait: ['持有 USDT', '等待超卖'],
+  buy: ['调仓买入', '偏离下轨'], sell: ['调仓卖出', '均值回归'],
+  rebuy: ['目标权重', '择优 1 币'], resell: ['回到 USDT', 'BTC risk-off'], pnl: ['组合权益', ''],
+};
 
 function setTreeLabels(labels) {
   NODES.forEach(([id]) => {
@@ -826,7 +844,10 @@ function updateTree(s) {
   }
   if (s.strategy_kind === 'predictive') {
     const p = s.predictive || {};
-    setTreeLabels(PREDICTIVE_TREE_LABELS);
+    const model = p.model || 'ridge';
+    setTreeLabels(model === 'dual_momentum' ? DUAL_MOMENTUM_TREE_LABELS :
+      model === 'ema_trend' ? EMA_TREND_TREE_LABELS :
+      model === 'bollinger_reversion' ? BOLLINGER_TREE_LABELS : PREDICTIVE_TREE_LABELS);
     spawnPredictiveParticles(s, p);
     const active = new Set(['tick', 'price', 'detect']);
     if ((p.target || []).length) { active.add('buy'); active.add('rebuy'); active.add('pnl'); }
@@ -846,9 +867,15 @@ function updateTree(s) {
       return;
     }
     const target = (p.target || []).map(x => x.replace('_USDT', '')).join(' / ');
+    const title = model === 'dual_momentum' ? '双动量轮动' : model === 'ema_trend' ? 'EMA 趋势轮动' :
+      model === 'bollinger_reversion' ? '布林回归轮动' : 'Ridge 预测轮动';
+    const rule = model === 'dual_momentum' ? '正动量且 BTC 长趋势放行' :
+      model === 'ema_trend' ? '快线高于慢线且 BTC 长趋势放行' :
+      model === 'bollinger_reversion' ? '布林下轨超卖且 BTC 长趋势放行' :
+      `预测超过 ${fmt((p.threshold || 0) * 100, 2)}% 且 BTC 风控放行`;
     strip.textContent = target
-      ? `Ridge 预测轮动 · 目标 ${target} · ${p.horizon_hours || 48}h 预测 · 每 ${p.rebalance_hours || 24}h 决策`
-      : `Ridge 预测轮动 · 持有 USDT · 等待预测超过 ${fmt((p.threshold || 0) * 100, 2)}% 且 BTC 风控放行`;
+      ? `${title} · 目标 ${target} · 每 ${p.rebalance_hours || 24}h 决策`
+      : `${title} · 持有 USDT · 等待${rule}`;
     return;
   }
   setTreeLabels(GRID_TREE_LABELS);
@@ -1043,13 +1070,21 @@ function render(s) {
   /* 网格扫描器 / 研究策略信号面板 */
   if (s.strategy_kind === 'predictive') {
     const p = s.predictive || {};
+    const model = p.model || 'ridge';
+    const scoreTitle = model === 'dual_momentum' ? '动量/波动率评分' :
+      model === 'ema_trend' ? 'EMA 趋势评分' :
+      model === 'bollinger_reversion' ? '布林偏离评分' : `预测 ${p.horizon_hours || 48}h 收益`;
+    const score = pred => {
+      if (pred === null || pred === undefined) return model === 'ridge' ? '等待训练' : '等待评分';
+      return model === 'ridge' ? `${pred >= 0 ? '+' : ''}${fmt(pred * 100, 3)}%` : fmt(pred, 3);
+    };
     $('scanRows').innerHTML = Object.values(s.pairs).filter(d => d.pair !== 'USDT').map(d => {
       const pred = d.predicted_return;
       const selected = !!d.selected;
       return `<div class="scan-row">
         <div class="scan-head"><span>${d.pair.replace('_', '/')} <b class="${selected ? 'up' : ''}" style="font-size:10px">${selected ? '已入选' : '候选'}</b></span><span class="mono-num">${fmtPrice(d.price)}</span></div>
-        <div class="scan-mid"><span>预测 ${p.horizon_hours || 48}h 收益 <b class="mono-num ${signCls(pred || 0)}">${pred === null || pred === undefined ? '等待训练' : (pred >= 0 ? '+' : '') + fmt(pred * 100, 3) + '%'}</b></span></div>
-        <div class="scan-mid"><span>阈值 <b class="mono-num">${fmt((p.threshold || 0) * 100, 2)}%</b></span><span>状态 <b class="${selected ? 'up' : ''}">${selected ? '持有/调仓目标' : 'USDT 等待'}</b></span></div>
+        <div class="scan-mid"><span>${scoreTitle} <b class="mono-num ${signCls(pred || 0)}">${score(pred)}</b></span></div>
+        <div class="scan-mid"><span>${model === 'ridge' ? '阈值' : '规则'} <b class="mono-num">${model === 'dual_momentum' ? '正分 Top 2' : model === 'ema_trend' ? '12/72 EMA Top 2' : model === 'bollinger_reversion' ? '下轨+RSI' : fmt((p.threshold || 0) * 100, 2) + '%'}</b></span><span>状态 <b class="${selected ? 'up' : ''}">${selected ? '持有/调仓目标' : 'USDT 等待'}</b></span></div>
       </div>`;
     }).join('');
   } else if (s.strategy_kind === 'doge_trend') {

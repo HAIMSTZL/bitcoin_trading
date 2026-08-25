@@ -20,6 +20,8 @@ class Profile:
     label: str
     pairs: tuple[str, ...]
     kind: str = "grid"             # grid | predictive | doge_trend；后两者仅支持模拟盘
+    # predictive 引擎可承载滚动模型或完全确定性的规则评分，均只允许模拟盘。
+    signal_model: str = "ridge"
     use_signal_filter: bool = True   # 指标信号过滤
     adaptive_range: bool = True      # ATR 自适应区间
     dynamic_allocation: bool = True  # 波动率动态分配 + 定期再平衡
@@ -68,6 +70,22 @@ PROFILES: dict[str, Profile] = {
     "predictive": Profile(
         name="predictive", label="先知轮动",
         pairs=config.PREDICTIVE_PAIRS, kind="predictive",
+        use_signal_filter=False, adaptive_range=False,
+        dynamic_allocation=False, slot_rotation=False,
+    ),
+    # GitHub 策略调研后迁移的低频规则候选：不依赖训练数据，而是以相对动量/
+    # 波动率评分选出强势币，并以 BTC 长 EMA 作为 risk-off 开关。
+    "dual_momentum": Profile(
+        name="dual_momentum", label="双动量轮动",
+        pairs=config.PREDICTIVE_PAIRS, kind="predictive", signal_model="dual_momentum",
+        use_signal_filter=False, adaptive_range=False,
+        dynamic_allocation=False, slot_rotation=False,
+    ),
+    # EMA 快慢线趋势轮动：与双动量共用低频与 BTC 风控，但信号来自趋势结构而非
+    # 收益/波动率比，作为第二个独立的纸盘趋势候选。
+    "ema_trend": Profile(
+        name="ema_trend", label="EMA 趋势轮动",
+        pairs=config.PREDICTIVE_PAIRS, kind="predictive", signal_model="ema_trend",
         use_signal_filter=False, adaptive_range=False,
         dynamic_allocation=False, slot_rotation=False,
     ),

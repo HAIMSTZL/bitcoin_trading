@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 import time
 
 from trading import config
@@ -172,6 +173,39 @@ def test_predictive_tick_skips_partial_tickers_without_overwriting_complete_pric
     assert engine.last_error is None
     assert decisions == [True]
     assert any(args[1] == "predictive_price_recovered" for args, _ in events)
+
+
+def test_predictive_bootstrap_allows_missing_unheld_candidates(monkeypatch):
+    """重启时只要当前持仓可安全估值，就不应被无持仓候选币卡在预热页。"""
+    engine = PredictivePaperEngine.__new__(PredictivePaperEngine)
+    engine.pairs = ["BTC_USDT", "ETH_USDT"]
+    engine.base = {"BTC_USDT": 1.0, "ETH_USDT": 0.0}
+    engine.prices = {"BTC_USDT": 0.0, "ETH_USDT": 0.0}
+    engine.candles = {"BTC_USDT": [Candle(10, 1, 1, 1, 1)]}
+    engine._refresh_history = lambda force=False: None
+    engine._mark_prices_partial = PredictivePaperEngine._mark_prices_partial.__get__(engine)
+    engine._price_partial_missing = ()
+    engine._price_partial_since = None
+    engine._last_price_partial_event = 0.0
+    engine._price_observed_at = None
+    engine._cache_path = "test-cache.json"
+    engine._ready = threading.Event()
+    engine._initializing = True
+    engine._init_error = "old"
+    events = []
+    engine._event = lambda *args, **kwargs: events.append((args, kwargs))
+
+    monkeypatch.setattr(
+        "trading.predictive_engine._fetch_tickers_cached",
+        lambda *args, **kwargs: {"BTC_USDT": 100.0},
+    )
+
+    engine._bootstrap_market_data()
+
+    assert engine._ready.is_set()
+    assert engine.prices == {"BTC_USDT": 100.0, "ETH_USDT": 0.0}
+    assert engine._price_partial_missing == ("ETH_USDT",)
+    assert any(args[1] == "predictive_ready" for args, _ in events)
 
 
 def test_predictive_state_exposes_latest_candle_for_real_time_flow_visualisation():

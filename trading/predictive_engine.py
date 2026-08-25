@@ -12,6 +12,7 @@ import math
 import threading
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from .predictive import (
     _feature_matrix,
     load_market_snapshot,
     _new_model,
+    rule_target,
     save_market_snapshot,
     _training_set,
 )
@@ -44,6 +46,9 @@ _PREDICTIVE_TICKER_WARM_WAIT_SEC = max(
     _TICKER_BOOTSTRAP_WAIT_SEC, config.PREDICTIVE_TICKER_WARM_WAIT_SEC,
 )
 _PRICE_PARTIAL_EVENT_INTERVAL_SEC = 60.0
+# 所有预测类 profile 使用同一币池、同一份 1h 快照。刷新时只允许一个后台引擎
+# 访问 Gate；其余引擎在锁内读取刚写入的原子快照，避免新增策略把 K 线请求放大。
+_HISTORY_CACHE_REFRESH_LOCK = threading.Lock()
 
 
 class PredictivePaperEngine:
@@ -72,9 +77,29 @@ class PredictivePaperEngine:
             expected_return_threshold=config.PREDICTIVE_THRESHOLD,
             max_positions=config.PREDICTIVE_MAX_POSITIONS,
             market_ema_period=config.PREDICTIVE_MARKET_EMA,
-            # 研究结论表明 XGBoost 当前过拟合；纸盘固定使用 ridge 候选。
-            model="ridge",
+            # Profile 固定指定研究算法；不允许由 Web 输入切换，且所有模型均为 paper-only。
+            model=getattr(profile, "signal_model", "ridge"),
         )
+        if self.settings.model == "dual_momentum":
+            self.settings = replace(
+                self.settings, rebalance_interval_bars=48, max_positions=2,
+                market_ema_period=200, slippage_bps=10.0,
+                momentum_lookback_bars=72, momentum_volatility_bars=24,
+            )
+        elif self.settings.model == "ema_trend":
+            self.settings = replace(
+                self.settings, rebalance_interval_bars=48, max_positions=2,
+                market_ema_period=200, slippage_bps=10.0,
+                trend_fast_ema=12, trend_slow_ema=72,
+            )
+        elif self.settings.model == "bollinger_reversion":
+            self.settings = replace(
+                self.settings, rebalance_interval_bars=24, max_positions=1,
+                market_ema_period=100, slippage_bps=10.0,
+                bollinger_period=30, bollinger_stddev=2.0,
+                bollinger_rsi_period=14, bollinger_rsi_threshold=35.0,
+                mean_reversion_trend_ema=100,
+            )
         # 预测策略只读公开行情，不依赖交易 API Key；K 线和 ticker 都经由统一客户端。
         self.client = GatePublicClient(timeout=20.0, retries=3)
         self.store = Store(profile.db_path)
@@ -229,6 +254,9 @@ class PredictivePaperEngine:
             )
             return
         latest = self.candles[self.pairs[0]][-1]
+        # 缓存的写入时间同时是本引擎最近一次已知刷新时间。这样刚重启的多个
+        # profile 会先复用仍新鲜的快照，而不是每个都立即再拉一遍十币 K 线。
+        self._last_history_refresh = self._cache_path.stat().st_mtime
         self._event(
             "INFO", "predictive_cache",
             f"已从本地缓存恢复 {len(self.candles[self.pairs[0]])} 根共同 1h K 线",
@@ -290,30 +318,54 @@ class PredictivePaperEngine:
             self._update_decision_freshness()
             return False
         old_latest = self.candles[self.pairs[0]][-1].ts
-        updates: dict[str, list[Candle]] = {}
-        failures: dict[str, str] = {}
-        for pair in self.pairs:
-            # 留两个小时重叠，防止接口边界、延迟或去重造成新收盘 K 线缺失。
-            start_ts = self.candles[pair][-1].ts - 2 * 3600
+        with _HISTORY_CACHE_REFRESH_LOCK:
+            # 等待同类引擎刷新期间，若共享快照已变新，直接接力使用它而不产生
+            # 第二轮请求。原子 replace 保障读者不会看到半写入 JSON。
             try:
-                updates[pair] = fetch_gate_candles(
-                    pair, "1h", start_ts, int(now), client=self.client,
-                )
-            except Exception as error:
-                failures[pair] = f"{type(error).__name__}: {error}"
-        limit = config.PREDICTIVE_HISTORY_DAYS * 24 + 8
-        merged = {}
-        for pair in self.pairs:
-            by_ts = {candle.ts: candle for candle in self.candles[pair]}
-            by_ts.update({candle.ts: candle for candle in updates.get(pair, ())})
-            merged[pair] = [by_ts[ts] for ts in sorted(by_ts)[-limit:]]
-        self.candles = _align(merged, self.pairs)
-        self._assert_history_ready()
-        self._last_history_refresh = now
-        self._update_decision_freshness()
-        changed = self.candles[self.pairs[0]][-1].ts > old_latest
-        if changed:
-            self._save_history_cache()
+                cache_mtime = self._cache_path.stat().st_mtime
+            except OSError:
+                cache_mtime = 0.0
+            if cache_mtime > self._last_history_refresh:
+                try:
+                    cached = load_market_snapshot(self._cache_path, self.pairs)
+                    self.candles = _align(cached, self.pairs)
+                    self._assert_history_ready()
+                except Exception as error:
+                    # 缓存是性能优化而非可用性依赖；本引擎保留内存旧数据并自行
+                    # 向 Gate 增量刷新，不能因为另一线程的异常快照而停止决策。
+                    self._event(
+                        "WARNING", "predictive_cache_refresh_invalid",
+                        f"共享预测快照读取失败，回退增量刷新：{type(error).__name__}: {error}",
+                    )
+                else:
+                    self._last_history_refresh = cache_mtime
+                    self._update_decision_freshness()
+                    return self.candles[self.pairs[0]][-1].ts > old_latest
+
+            updates: dict[str, list[Candle]] = {}
+            failures: dict[str, str] = {}
+            for pair in self.pairs:
+                # 留两个小时重叠，防止接口边界、延迟或去重造成新收盘 K 线缺失。
+                start_ts = self.candles[pair][-1].ts - 2 * 3600
+                try:
+                    updates[pair] = fetch_gate_candles(
+                        pair, "1h", start_ts, int(now), client=self.client,
+                    )
+                except Exception as error:
+                    failures[pair] = f"{type(error).__name__}: {error}"
+            limit = config.PREDICTIVE_HISTORY_DAYS * 24 + 8
+            merged = {}
+            for pair in self.pairs:
+                by_ts = {candle.ts: candle for candle in self.candles[pair]}
+                by_ts.update({candle.ts: candle for candle in updates.get(pair, ())})
+                merged[pair] = [by_ts[ts] for ts in sorted(by_ts)[-limit:]]
+            self.candles = _align(merged, self.pairs)
+            self._assert_history_ready()
+            self._last_history_refresh = now
+            self._update_decision_freshness()
+            changed = self.candles[self.pairs[0]][-1].ts > old_latest
+            if changed:
+                self._save_history_cache()
         if failures:
             self._event(
                 "WARNING", "predictive_history_partial",
@@ -325,17 +377,24 @@ class PredictivePaperEngine:
     def _bootstrap_market_data(self) -> None:
         """在引擎线程中完成缓存补齐和行情读取，避免构造函数阻塞 Web。"""
         if self.candles:
-            self._refresh_history(force=True)
+            self._refresh_history()
         else:
             self._load_initial_history()
-        # 这是后台预热而不是 tick：给四并发行情请求足够时间完成两三批，避免
-        # 网络正常但 RTT 略高于运行时 1 秒预算时反复预热失败。不会占用 ticker 锁。
-        self.prices = _fetch_tickers_cached(
+        # 启动时不再把“全部十个候选币”当作就绪门槛：候选币短暂缺价时，当前持仓
+        # 仍可安全恢复估值，后续 tick 会坚持完整行情才允许再平衡。只有已有持仓缺价
+        # 才维持预热，避免将未知价格伪造成组合权益。
+        observed_prices = _fetch_tickers_cached(
             None, self.pairs, initial_wait_sec=_PREDICTIVE_TICKER_WARM_WAIT_SEC,
+            allow_partial=True,
         )
-        missing = [pair for pair in self.pairs if self.prices.get(pair, 0.0) <= 0]
+        held_pairs = [pair for pair in self.pairs if self.base[pair] > 1e-12]
+        missing_held = [pair for pair in held_pairs if observed_prices.get(pair, 0.0) <= 0]
+        if missing_held:
+            raise RuntimeError(f"未获取到当前持仓行情: {', '.join(missing_held)}")
+        self.prices = {pair: observed_prices.get(pair, 0.0) for pair in self.pairs}
+        missing = [pair for pair in self.pairs if self.prices[pair] <= 0]
         if missing:
-            raise RuntimeError(f"未获取到预测币池行情: {', '.join(missing)}")
+            self._mark_prices_partial(missing)
         self._price_observed_at = time.time()
         self._ready.set()
         self._initializing = False
@@ -356,6 +415,24 @@ class PredictivePaperEngine:
         count = len(self.candles[self.pairs[0]])
         index = count - 1
         current_candle = self.candles[self.pairs[0]][index]
+        if self.settings.model in ("dual_momentum", "ema_trend", "bollinger_reversion"):
+            target, scores, risk_on = rule_target(self.candles, index, self.settings)
+            if emit_signal:
+                names = {
+                    "dual_momentum": "双动量决策",
+                    "ema_trend": "EMA 趋势决策",
+                    "bollinger_reversion": "布林回归决策",
+                }
+                self._event(
+                    "INFO", "predictive_signal",
+                    names[self.settings.model] + ": " + (
+                        f"目标 {','.join(target)}" if target else "空仓（无合格候选或 BTC 风控）"
+                    ),
+                    detail={"scores": scores, "target": target, "risk_on": risk_on,
+                            "model": self.settings.model, "candle_ts": current_candle.ts,
+                            "execution": decision_audit or {}},
+                )
+            return target, scores
         features = {pair: _feature_matrix(self.candles[pair]) for pair in self.pairs}
         labels = {
             pair: np.asarray([
@@ -499,7 +576,8 @@ class PredictivePaperEngine:
         )
         # 模型对象不会持久化。重启后的首次 tick 只恢复训练和评分，不在既定
         # 决策日之前重复调仓，避免因为进程恢复产生额外的虚拟成交。
-        if not due and self._model is None:
+        if (not due and self._model is None
+                and self.settings.model in ("ridge", "xgboost")):
             _, scores = self._fit_and_score(emit_signal=False)
             self.predictions = scores
             self._event(
@@ -816,7 +894,7 @@ class PredictivePaperEngine:
             "total_fees": self.total_fees, "pairs": rows,
             "indicators": {}, "signal_filter": False,
             "predictive": {
-                "model": "ridge", "target": list(self.target), "predictions": self.predictions,
+                "model": self.settings.model, "target": list(self.target), "predictions": self.predictions,
                 "horizon_hours": self.settings.horizon_bars,
                 "rebalance_hours": self.settings.rebalance_interval_bars,
                 "threshold": self.settings.expected_return_threshold,
