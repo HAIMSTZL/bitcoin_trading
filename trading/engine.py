@@ -45,6 +45,8 @@ _TICKER_BOOTSTRAP_WAIT_SEC = 8.0
 _TICKER_MAX_STALE_SEC = 30.0
 _TICKER_FAILURE_LIMIT = 3
 _TICKER_SLOW_REFRESH_SEC = 5.0
+# 行情短暂不完整是可自愈的运行状态，不应每个 3 秒 tick 都写一条异常事件。
+_PRICE_PARTIAL_EVENT_INTERVAL_SEC = 60.0
 _TICKER_TASKS: queue.Queue = queue.Queue()
 _TICKER_WORKERS: list[threading.Thread] = []
 _TICKER_WORKERS_LOCK = threading.Lock()
@@ -347,6 +349,11 @@ class Engine:
         # API 中断告警状态
         self._last_success: Optional[float] = None  # 最近一次成功 tick 时间
         self._api_outage = False  # 是否处于持续中断告警状态
+        # ticker 允许按币对降级：缺失的山寨币仅跳过自身，BTC 缺失则保守暂停整个
+        # 网格组（不能在大盘熔断基准失明时继续成交）。这些字段用于聚合审计事件。
+        self._price_partial_missing: tuple[str, ...] = ()
+        self._price_partial_since: Optional[float] = None
+        self._last_price_partial_event = 0.0
         # 行情预热不能阻塞 Web 服务，更不能因短暂网络故障让 run.py 退出。
         # 由引擎线程在后台完成，并按 ENGINE_INIT_RETRY_SEC 自动重试。
         self._ready = threading.Event()
@@ -363,6 +370,7 @@ class Engine:
     # ------------------------------------------------------------------
     def _fetch_prices(
         self, *, initial_wait_sec: float = _TICKER_INITIAL_WAIT_SEC,
+        allow_partial: bool = False,
     ) -> dict[str, float]:
         """按币对分别查询 ticker（响应小、抗超时；全市场单次拉取响应数 MB 易超时）。
 
@@ -372,6 +380,7 @@ class Engine:
         """
         return _fetch_tickers_cached(
             None, set(self.pairs) | {"BTC_USDT"}, initial_wait_sec=initial_wait_sec,
+            allow_partial=allow_partial,
         )
 
     def _initialize(self) -> None:
@@ -718,10 +727,42 @@ class Engine:
                 self._event("ERROR", "live_order_error", f"实盘下单失败: {e}",
                             pair=fill["pair"], detail={"fill": fill})
 
-    def tick(self) -> None:
+    def tick(self) -> bool:
         # 与 reset_paper 互斥：重置清空存档期间，进行中的 tick 不得再把旧状态落盘
         with self._tick_lock:
-            self._tick_body()
+            return self._tick_body()
+
+    def _mark_prices_partial(self, missing: list[str]) -> None:
+        """聚合记录 ticker 子集缺失，避免短抖动把事件库刷满。"""
+        now = time.time()
+        current = tuple(sorted(missing))
+        previous = getattr(self, "_price_partial_missing", ())
+        changed = current != previous
+        if not previous:
+            self._price_partial_since = now
+        self._price_partial_missing = current
+        if changed or now - self._last_price_partial_event >= _PRICE_PARTIAL_EVENT_INTERVAL_SEC:
+            self._last_price_partial_event = now
+            self._event(
+                "WARNING", "market_data_partial",
+                "ticker 行情不完整；已跳过缺失币对，本轮其余安全网格继续运行："
+                + ", ".join(current),
+                detail={"missing": list(current), "since": self._price_partial_since},
+            )
+
+    def _mark_prices_complete(self) -> None:
+        """行情恢复完整时写一条恢复事件，保留中断区间供复盘。"""
+        if not getattr(self, "_price_partial_missing", ()):
+            return
+        missing = self._price_partial_missing
+        since = self._price_partial_since
+        self._price_partial_missing = ()
+        self._price_partial_since = None
+        self._event(
+            "INFO", "market_data_recovered",
+            "ticker 行情已恢复完整：" + ", ".join(missing),
+            detail={"previous_missing": list(missing), "partial_since": since},
+        )
 
     def _record_tick_decision(
         self,
@@ -751,21 +792,36 @@ class Engine:
             "fills": compact_fills,
         }
 
-    def _tick_body(self) -> None:
+    def _tick_body(self) -> bool:
         if self._warm_next_tick:
             self._warm_next_tick = False
-            self.prices = self._fetch_prices(initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC)
+            observed_prices = self._fetch_prices(
+                initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC, allow_partial=True,
+            )
         else:
-            self.prices = self._fetch_prices()
-        self._check_circuit_breaker()  # 熔断检测永远运行（含熔断期间，用于企稳恢复）
+            observed_prices = self._fetch_prices(allow_partial=True)
+        active_pairs = list(getattr(self, "pairs", self.bots.keys()))
+        required_pairs = set(active_pairs) | {"BTC_USDT"}
+        missing = sorted(pair for pair in required_pairs if observed_prices.get(pair, 0.0) <= 0)
+        self.prices = observed_prices
+        if missing:
+            self._mark_prices_partial(missing)
+        else:
+            self._mark_prices_complete()
+
+        # BTC 是全局熔断基准。它缺失时宁可暂停本策略组，也不能在风险护栏失明时成交。
+        btc_available = observed_prices.get("BTC_USDT", 0.0) > 0
+        if btc_available:
+            self._check_circuit_breaker()  # 熔断检测永远运行（含熔断期间，用于企稳恢复）
         self._update_indicators()
-        if not self._cb_global:
+        # 行情不完整时不做资金再平衡或换槽，避免用局部行情改变全组合资金分配。
+        if not self._cb_global and not missing:
             self._maybe_rebalance()
         fills: list[dict] = []
         checked_pairs = 0
         skipped_pairs: list[str] = []
         for pair, bot in self.bots.items():
-            if self._cb_global or pair in self._cb_pairs:
+            if not btc_available or self._cb_global or pair in self._cb_pairs:
                 skipped_pairs.append(pair)
                 continue  # 熔断中：不撮合、不补单
             price = self.prices.get(pair)
@@ -778,7 +834,8 @@ class Engine:
             checked_pairs += 1
         self.last_tick = time.time()
         self._record_tick_decision(fills, checked_pairs, skipped_pairs)
-        self._maybe_fill_slot()  # 空仓槽位补位筛选
+        if not missing:
+            self._maybe_fill_slot()  # 空仓槽位补位筛选
         self._save_bot_states()  # 模拟盘每个 tick 落盘，保证重启后可续跑
 
         # 权益快照按时间驱动（30 秒一条），tick 卡顿也不丢曲线
@@ -789,7 +846,15 @@ class Engine:
                 state["total_equity"], state["total_realized_profit"],
                 {p: s["equity"] for p, s in state["pairs"].items()},
             )
+        # 只要至少一个交易币对报价可用，本 tick 就是可用的运行进展；单币缺失不应
+        # 被计为整套策略 API 中断。BTC 缺失则为保守暂停，交由 run() 追踪持续中断。
+        progressed = btc_available and any(
+            observed_prices.get(pair, 0.0) > 0 for pair in active_pairs
+        )
+        if not progressed:
+            self.last_error = "ticker 无可用交易价格；已暂停本轮网格撮合"
         self._maybe_health_check()
+        return progressed
 
     # ------------------------------------------------------------------
     # 槽位补位：空仓币对触发全市场筛选，最优合格候选替换
@@ -1175,13 +1240,25 @@ class Engine:
                 self._stop.wait(config.TICK_INTERVAL)
                 continue
             try:
-                self.tick()
-                self.last_error = None
-                self._last_success = time.time()
-                if self._api_outage:
-                    self._api_outage = False
-                    log.warning("API 连接已恢复")
-                    self._event("INFO", "api_recovered", "API 连接已恢复，交易继续")
+                tick_progressed = self.tick()
+                if tick_progressed:
+                    self.last_error = None
+                    self._last_success = time.time()
+                    if self._api_outage:
+                        self._api_outage = False
+                        log.warning("API 连接已恢复")
+                        self._event("INFO", "api_recovered", "API 连接已恢复，交易继续")
+                elif (self._last_success
+                      and time.time() - self._last_success > config.API_OUTAGE_ALERT_SEC
+                      and not self._api_outage):
+                    self._api_outage = True
+                    log.error("API 持续中断超过 %ds", config.API_OUTAGE_ALERT_SEC)
+                    self._event(
+                        "ERROR", "api_outage",
+                        f"API 持续中断超过 {config.API_OUTAGE_ALERT_SEC:.0f} 秒！"
+                        f"最近错误: {self.last_error}。系统将持续重试，恢复后自动继续。",
+                        detail={"last_error": self.last_error},
+                    )
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
                 log.exception("tick 失败")
@@ -1339,6 +1416,11 @@ class Engine:
                 "pairs": sorted(self._cb_pairs.keys()),
             },
             "api_outage": self._api_outage,
+            "market_data": {
+                "partial": bool(getattr(self, "_price_partial_missing", ())),
+                "missing_pairs": list(getattr(self, "_price_partial_missing", ())),
+                "partial_since": getattr(self, "_price_partial_since", None),
+            },
             "last_success": self._last_success,
             "started_at": self.started_at,
             "last_tick": self.last_tick,

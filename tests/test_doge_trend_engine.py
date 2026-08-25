@@ -81,7 +81,9 @@ def test_doge_trend_only_processes_a_new_closed_candle_once():
 
 
 def test_doge_trend_signals_half_position_on_closed_rsi_oversold():
-    engine, events = _paper_engine()
+    engine, _ = _paper_engine()
+    events = []
+    engine._event = lambda *args, **kwargs: events.append((args, kwargs))
     # 连续下跌使 20 期 RSI 为 0；最后一根已收盘 K 线才用于触发信号。
     closes = [2.0 - index * 0.02 for index in range(23)]
     engine.candles = [Candle(index * 3600, close, close, close, close)
@@ -122,6 +124,27 @@ def test_doge_trend_engine_waits_for_rsi_rearm_after_stop():
 
     assert engine.pending_target is None
     assert engine.rsi_rearmed is False
+
+
+def test_doge_trend_ticker_gap_pauses_without_raising_tick_error(monkeypatch):
+    """单币 ticker 暂缺只跳过本轮判断；恢复后仍由 run() 正常推进。"""
+    engine, _ = _paper_engine()
+    events = []
+    engine._event = lambda *args, **kwargs: events.append((args, kwargs))
+    engine._price_partial_since = None
+    engine._last_price_partial_event = 0.0
+    engine._warm_next_tick = False
+    engine.last_error = None
+    engine._refresh_history = lambda: None
+    monkeypatch.setattr(
+        "trading.doge_trend_engine._fetch_tickers_cached",
+        lambda *args, **kwargs: {},
+    )
+
+    assert engine.tick() is False
+    assert engine.prices == {engine.pair: 1.0}  # 面板继续展示上一帧，不以 0 估值
+    assert "ticker 暂不可用" in engine.last_error
+    assert any(args[1] == "doge_trend_price_partial" for args, _ in events)
 
 
 def test_doge_trend_constructor_is_nonblocking_and_paper_only(tmp_path, monkeypatch):

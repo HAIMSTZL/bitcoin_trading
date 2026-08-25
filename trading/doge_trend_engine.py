@@ -27,6 +27,7 @@ from .store import Store
 log = logging.getLogger("trading.doge_trend_engine")
 _STATE_KEY = "__doge_trend_portfolio__"
 _CANDLE_SECONDS = 60 * 60
+_PRICE_PARTIAL_EVENT_INTERVAL_SEC = 60.0
 
 
 class DogeTrendPaperEngine:
@@ -120,6 +121,9 @@ class DogeTrendPaperEngine:
         self._thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
         self._warm_next_tick = False
+        # ticker 暂缺不是策略异常：保留 K 线状态，暂停当次单币成交并以聚合事件审计。
+        self._price_partial_since: float | None = None
+        self._last_price_partial_event = 0.0
 
         self._restore_or_seed()
         self._load_cached_history()
@@ -564,19 +568,48 @@ class DogeTrendPaperEngine:
     # ------------------------------------------------------------------
     # 引擎循环、控制与 Web 状态
     # ------------------------------------------------------------------
-    def tick(self) -> None:
+    def _mark_price_partial(self) -> None:
+        now = time.time()
+        first = self._price_partial_since is None
+        if first:
+            self._price_partial_since = now
+        if first or now - self._last_price_partial_event >= _PRICE_PARTIAL_EVENT_INTERVAL_SEC:
+            self._last_price_partial_event = now
+            self._event(
+                "WARNING", "doge_trend_price_partial",
+                f"{self.asset} ticker 暂不可用；已跳过本轮低吸判断，等待行情恢复",
+                pair=self.pair, detail={"since": self._price_partial_since},
+            )
+
+    def _mark_price_recovered(self) -> None:
+        if self._price_partial_since is None:
+            return
+        since = self._price_partial_since
+        self._price_partial_since = None
+        self._event(
+            "INFO", "doge_trend_price_recovered",
+            f"{self.asset} ticker 已恢复，低吸判断继续",
+            pair=self.pair, detail={"partial_since": since},
+        )
+
+    def tick(self) -> bool:
         self._refresh_history()
         if self._warm_next_tick:
             self._warm_next_tick = False
-            self.prices = _fetch_tickers_cached(
+            observed_prices = _fetch_tickers_cached(
                 None, self.pairs, initial_wait_sec=_TICKER_BOOTSTRAP_WAIT_SEC,
+                allow_partial=True,
             )
         else:
-            self.prices = _fetch_tickers_cached(None, self.pairs)
+            observed_prices = _fetch_tickers_cached(None, self.pairs, allow_partial=True)
         self._price_observed_at = time.time()
-        mid = self.prices.get(self.pair, 0.0)
+        mid = observed_prices.get(self.pair, 0.0)
         if mid <= 0:
-            raise RuntimeError(f"{self.pair} 无可用 ticker 价格")
+            self._mark_price_partial()
+            self.last_error = f"{self.pair} ticker 暂不可用；已跳过本轮低吸判断"
+            return False
+        self.prices = observed_prices
+        self._mark_price_recovered()
         new_candle = self._observe_new_candle()
         self._maybe_exit(mid)
         if new_candle:
@@ -589,6 +622,7 @@ class DogeTrendPaperEngine:
             self.store.record_equity(self._equity(), self.realized_profit,
                                      {self.pair: self.base * mid, "USDT": self.quote})
         self._maybe_health_check()
+        return True
 
     def _maybe_health_check(self) -> None:
         now = time.time()
@@ -791,6 +825,11 @@ class DogeTrendPaperEngine:
             "run_status": self.run_status,
             "circuit_breaker": {"global": False, "pairs": []},
             "api_outage": self._api_outage, "last_success": self._last_success,
+            "market_data": {
+                "partial": self._price_partial_since is not None,
+                "missing_pairs": [self.pair] if self._price_partial_since is not None else [],
+                "partial_since": self._price_partial_since,
+            },
             "started_at": self.started_at, "last_tick": self.last_tick,
             "last_error": self.last_error, "total_equity": equity,
             "total_initial_equity": self._initial_total, "total_pnl": equity - self._initial_total,
