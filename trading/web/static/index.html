@@ -600,6 +600,26 @@ const WIRES = [
 ];
 const nodePos = {};
 const wirePaths = {};   // 'a>b' -> {p1, c1, c2, p2}（像素坐标，贝塞尔曲线）
+const GRID_TREE_LABELS = {
+  tick: ['TICK FEED', '3s 轮询'], price: ['获取最新价', 'gate ticker'],
+  detect: ['档位穿越检测', ''], wait: ['无穿越', '等待下一TICK'],
+  buy: ['买单成交', '价格≤买档'], sell: ['卖单成交', '价格≥卖档'],
+  rebuy: ['补挂卖单', '上一档'], resell: ['补挂买单', '下一档'], pnl: ['利润结算', ''],
+};
+const PREDICTIVE_TREE_LABELS = {
+  tick: ['TICK FEED', '3s 轮询'], price: ['读取行情', '10币 ticker'],
+  detect: ['Ridge 评分', '新 1h / 24h'], wait: ['维持仓位', '等待下一决策'],
+  buy: ['调仓买入', '目标增配'], sell: ['调仓卖出', '目标减配'],
+  rebuy: ['目标权重', '等权分配'], resell: ['回到 USDT', '风险/低分'], pnl: ['组合权益', ''],
+};
+
+function setTreeLabels(labels) {
+  NODES.forEach(([id]) => {
+    const el = $('node-' + id);
+    const [label, sub] = labels[id];
+    if (el) el.innerHTML = `<div>${label}${sub ? `<span class="sub">${sub}</span>` : ''}</div>`;
+  });
+}
 
 function buildTree() {
   const cvs = $('treeCanvas');
@@ -711,15 +731,17 @@ function spawnDecisionParticles(s, flow) {
   });
 }
 
-/* 成交粒子：买=蓝 卖=红，沿分支流向利润结算 */
-let lastFillEventId = null;
+/* 成交粒子：买=蓝 卖=红，沿分支流向利润结算。每个策略独立去重，切换 Tab
+   不会把另一个策略的成交误认为已经播放。 */
+const lastFillEventIds = new Map();
 function spawnFillParticles(s) {
   const fills = (s.recent_events || []).filter(e =>
     e.type === 'order_filled' || e.type === 'doge_trend_fill');
   if (!fills.length) return;
   const latest = fills[0];
-  if (latest.id === lastFillEventId) return;
-  lastFillEventId = latest.id;
+  const strategy = s.strategy || 'default';
+  if (latest.id === lastFillEventIds.get(strategy)) return;
+  lastFillEventIds.set(strategy, latest.id);
   if (Date.now() / 1000 - latest.ts > 30) return;  // 历史成交不补动画
   let d = {};
   try { d = JSON.parse(latest.detail || '{}'); } catch (_) {}
@@ -733,8 +755,41 @@ function spawnFillParticles(s) {
   spawnParticle(['rebuy>pnl'], '#1a7f37', 0.5);  // 绿色收尾流向利润
 }
 
+/* 先知轮动没有网格的逐档 decision_flow。以服务端实际时间戳驱动：每次 ticker
+   观察走轻量巡检；每根新确认 1h K 线提示等待下一次评分；每 24h 的决策时间推进
+   才展示 Ridge 评分与调仓目标路径。首次加载只建立基线，绝不补播历史动作。 */
+const predictiveFlowStates = new Map();
+function spawnPredictiveParticles(s, p) {
+  const strategy = s.strategy || 'predictive';
+  const now = {
+    ticker: p.ticker_observed_at || null,
+    candle: p.latest_candle_ts || null,
+    decision: p.last_decision_candle_ts || null,
+  };
+  const before = predictiveFlowStates.get(strategy);
+  predictiveFlowStates.set(strategy, now);
+  if (!before) return;
+  if (now.ticker && now.ticker !== before.ticker) {
+    spawnParticle(['tick>price', 'price>detect'], '#8b949e');
+  }
+  if (now.candle && now.candle !== before.candle) {
+    // 新 1h K 线仅表示资料已更新；模型按既定 24h 节奏才实际重新评分。
+    spawnParticle(['price>detect', 'detect>wait'], '#6e40c9', 0.08);
+  }
+  if (now.decision && now.decision !== before.decision) {
+    const target = p.target || [];
+    const branch = target.length
+      ? ['detect>buy', 'buy>rebuy', 'rebuy>pnl']
+      : ['detect>wait', 'wait>tick'];
+    // 紫色表示 Ridge 的重新评分；后续路径严格表示本次调仓目标，而不是伪造成交。
+    spawnParticle(['tick>price', 'price>detect'], '#6e40c9');
+    spawnParticle(branch, target.length ? '#2557d6' : '#8b949e', 0.18);
+  }
+}
+
 function updateTree(s) {
   if (s.strategy_kind === 'doge_trend') {
+    setTreeLabels(GRID_TREE_LABELS);
     spawnFillParticles(s);
     const d = s.doge_trend || {};
     const label = s.strategy_label || `${d.asset || '单币'} 低吸先锋`;
@@ -771,6 +826,8 @@ function updateTree(s) {
   }
   if (s.strategy_kind === 'predictive') {
     const p = s.predictive || {};
+    setTreeLabels(PREDICTIVE_TREE_LABELS);
+    spawnPredictiveParticles(s, p);
     const active = new Set(['tick', 'price', 'detect']);
     if ((p.target || []).length) { active.add('buy'); active.add('rebuy'); active.add('pnl'); }
     NODES.forEach(([id]) => {
@@ -794,6 +851,7 @@ function updateTree(s) {
       : `Ridge 预测轮动 · 持有 USDT · 等待预测超过 ${fmt((p.threshold || 0) * 100, 2)}% 且 BTC 风控放行`;
     return;
   }
+  setTreeLabels(GRID_TREE_LABELS);
   const now = Date.now() / 1000;
   const flow = s.decision_flow || {};
   const fresh = flow.ts && now - flow.ts < 10;

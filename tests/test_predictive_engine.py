@@ -172,3 +172,43 @@ def test_predictive_tick_skips_partial_tickers_without_overwriting_complete_pric
     assert engine.last_error is None
     assert decisions == [True]
     assert any(args[1] == "predictive_price_recovered" for args, _ in events)
+
+
+def test_predictive_state_exposes_latest_candle_for_real_time_flow_visualisation():
+    """前端只可消费真实已确认 K 线时间戳，不能自行臆造 1h 评分事件。"""
+    engine = PredictivePaperEngine.__new__(PredictivePaperEngine)
+    engine.pairs = ["AAA_USDT"]
+    engine.candles = {"AAA_USDT": [Candle(123 * 3600, 1, 1, 1, 1)]}
+    engine.prices = {"AAA_USDT": 1.0}
+    engine.base = {"AAA_USDT": 0.0}
+    engine.avg_cost = {"AAA_USDT": None}
+    engine.realized_profit = {"AAA_USDT": 0.0}
+    engine.trade_count = {"AAA_USDT": 0}
+    engine.quote = engine.total_fees = 0.0
+    engine.predictions = {}
+    engine.target = ()
+    engine.settings = PredictiveSettings(pairs=("AAA_USDT",))
+    engine.last_decision_candle_ts = engine.last_refit_candle_ts = 0
+    engine._ready = type("Ready", (), {"is_set": lambda self: True})()
+    engine._initializing = False
+    engine._init_error = None
+    engine._cache_path = "test-cache.json"
+    engine._price_observed_at = None
+    engine._price_partial_missing = ()
+    engine._price_partial_since = None
+    engine._decision_pause_reason = None
+    engine._candle_lag_seconds = None
+    engine._api_outage = False
+    engine._last_success = engine.started_at = engine.last_tick = None
+    engine.last_error = None
+    engine._initial_total = 0.0
+    engine.mode = "paper"
+    engine.profile = SimpleNamespace(name="predictive", label="test")
+    engine.store = SimpleNamespace(
+        recent_trades=lambda *_: [], recent_events=lambda *_: [], equity_history=lambda *_: [],
+    )
+
+    # run_status 是 property；构造其需要的最小控制状态。
+    engine._stopped = False
+    engine._paused = type("Pause", (), {"is_set": lambda self: False})()
+    assert engine.state()["predictive"]["latest_candle_ts"] == 123 * 3600

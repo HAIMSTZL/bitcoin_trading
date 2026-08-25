@@ -773,6 +773,10 @@ class PredictivePaperEngine:
             log.exception("预测策略事件落库失败: %s", type)
 
     def state(self) -> dict[str, Any]:
+        latest_candle_ts = (
+            self.candles[self.pairs[0]][-1].ts
+            if self.candles.get(self.pairs[0]) else None
+        )
         rows = {}
         for pair in self.pairs:
             price = self.prices.get(pair, 0.0)
@@ -819,6 +823,9 @@ class PredictivePaperEngine:
                 "slippage_bps": self.settings.slippage_bps,
                 "last_decision_candle_ts": self.last_decision_candle_ts,
                 "last_refit_candle_ts": self.last_refit_candle_ts,
+                # 供 Web 决策流辨别“新 1h K 线已确认”与“24h 重新评分/调仓”这
+                # 两类真实事件；不作为交易信号，交易时序仍由引擎内部控制。
+                "latest_candle_ts": latest_candle_ts,
                 "ready": self._ready.is_set(), "initializing": self._initializing,
                 "init_error": self._init_error, "cache_path": str(self._cache_path),
                 "ticker_observed_at": self._price_observed_at,
